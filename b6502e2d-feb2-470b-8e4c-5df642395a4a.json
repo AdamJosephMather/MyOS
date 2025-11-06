@@ -1,0 +1,4 @@
+{
+	"LSPs": {},
+	"build_command": "\n\nmake clean && make iso && make run"
+}

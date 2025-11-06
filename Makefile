@@ -1,0 +1,41 @@
+CC=clang
+CXX=clang++
+LD=ld.lld
+
+CFLAGS=-O2 -g -ffreestanding -fno-stack-protector -mno-red-zone -mcmodel=kernel -target x86_64-elf
+CXXFLAGS=$(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti
+LDFLAGS=-nostdlib -z max-page-size=0x1000
+
+SRC=src/kernel.cpp src/image_data.cpp
+OBJ=$(SRC:.cpp=.o)
+
+all: myos
+
+myos: $(OBJ) linker.ld
+	$(LD) $(LDFLAGS) -T linker.ld -o $@ $(OBJ)
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -I. -c $< -o $@
+
+iso: all
+	rm -rf iso_root
+	mkdir -p iso_root/boot
+	cp myos iso_root/boot/
+	cp limine.conf iso_root/               # <-- config must be named limine.conf
+	cp limine/limine-bios.sys iso_root/boot/
+	cp limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/
+
+	xorriso -as mkisofs -b limine-bios-cd.bin \
+	  -no-emul-boot -boot-load-size 4 -boot-info-table \
+	  --efi-boot limine-uefi-cd.bin \
+	  -efi-boot-part --efi-boot-image --protective-msdos-label \
+	  iso_root -o myos.iso
+
+	limine/limine bios-install myos.iso
+
+
+run: iso
+	qemu-system-x86_64 -cdrom myos.iso
+
+clean:
+	rm -rf iso_root $(OBJ) myos myos.iso
