@@ -35,7 +35,12 @@ iso: all
 
 
 run: iso
-	qemu-system-x86_64 -cdrom myos.iso
+	qemu-system-x86_64 \
+		-machine q35 \
+		-m 512M \
+		-bios OVMF.fd \
+		-cdrom myos.iso
+
 
 clean:
 	rm -rf iso_root $(OBJ) myos myos.iso
