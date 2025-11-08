@@ -510,7 +510,7 @@ extern "C" void kmain(void) {
 	
 	
 	// Let's go map the memmory
-	print("Setting up memory management")
+	print("Setting up memory management");
 //	init_va_layout();
 	init_physical_allocator();
 	map_region(HHDM, 0, max_hhdm_size, PRESENT | WRITABLE);
