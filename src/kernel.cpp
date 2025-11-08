@@ -40,7 +40,9 @@ __attribute__((used, section(".limine_requests_end")))
 static volatile LIMINE_REQUESTS_END_MARKER;
 
 
+struct limine_framebuffer *fb;
 uint64_t HHDM;
+bool debug = false;
 
 
 static const char map_unshift[0x60] = {
@@ -64,7 +66,7 @@ static inline void hcf() {
 	for (;;) { __asm__ __volatile__("hlt"); }
 }
 
-static inline void putp(struct limine_framebuffer *fb, uint32_t x, uint32_t y, uint32_t argb) {
+static inline void putp(uint32_t x, uint32_t y, uint32_t argb) {
 	if (x >= fb->width || y >= fb->height) return;
 	volatile uint32_t *base = (volatile uint32_t *)fb->address;
 	base[y * (fb->pitch / 4) + x] = argb;
@@ -125,7 +127,7 @@ static char scancode_to_char(uint8_t sc, KeyState& ks) {
 	return c;
 }
 
-static inline void fill_screen_fast(struct limine_framebuffer *fb, uint32_t argb) {
+static inline void fill_screen_fast(uint32_t argb) {
 	volatile uint8_t* base = (uint8_t*)fb->address;
 	const uint32_t w = fb->width;
 	for (uint32_t y = 0; y < fb->height; ++y) {
@@ -187,10 +189,7 @@ struct MCFGHeader {
 } __attribute__((packed));
 
 // returns a DWORD pointer in ECAM
-inline volatile uint32_t* pci_cfg_ptr(uint64_t virt_base,
-									  uint8_t start_bus,
-									  uint8_t bus, uint8_t dev, uint8_t fn,
-									  uint16_t off) {
+inline volatile uint32_t* pci_cfg_ptr32(uint64_t virt_base, uint8_t start_bus, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off) {
 	// ECAM: 1MiB per bus, 32 devs, 8 funcs, 4KiB per fn
 	// Validate offset is DWORD-aligned and within 4KiB
 	// (you can drop these checks in release):
@@ -204,6 +203,103 @@ inline volatile uint32_t* pci_cfg_ptr(uint64_t virt_base,
 
 	return (volatile uint32_t*)addr;  // DO NOT add PCI_ECAM_VIRT_BASE again
 }
+
+inline volatile uint16_t* pci_cfg_ptr16(uint64_t virt_base, uint8_t start_bus, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off) {
+	if ((off & 1) || off > 0xFFE) hcf();
+	uint64_t addr = virt_base
+				  + ((uint64_t)(bus - start_bus) << 20)
+				  + ((uint64_t)dev << 15)
+				  + ((uint64_t)fn  << 12)
+				  + off;
+	return (volatile uint16_t*)addr;
+}
+
+
+uint32_t pci_cfg_read32(uint64_t virt_base, uint8_t start_bus, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off) {
+	volatile uint32_t* val = pci_cfg_ptr32(virt_base, start_bus, bus, dev, fn, off);
+	return *val;
+}
+
+void pci_cfg_write32(uint64_t virt_base, uint8_t start_bus, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off, uint32_t towrite) {
+	volatile uint32_t* val = pci_cfg_ptr32(virt_base, start_bus, bus, dev, fn, off);
+	*val = towrite;
+}
+
+uint16_t pci_cfg_read16(uint64_t virt_base, uint8_t start_bus, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off) {
+	volatile uint16_t* val = pci_cfg_ptr16(virt_base, start_bus, bus, dev, fn, off);
+	return *val;
+}
+
+void pci_cfg_write16(uint64_t virt_base, uint8_t start_bus, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off, uint16_t towrite) {
+	volatile uint16_t* val = pci_cfg_ptr16(virt_base, start_bus, bus, dev, fn, off);
+	*val = towrite;
+}
+
+void u64_to_str(uint64_t value, char* buffer) {
+	if (value == 0) {
+		buffer[0] = '0';
+		buffer[1] = '\0';
+		return;
+	}
+	
+	int i = 0;
+	while (value > 0) {
+		buffer[i] = '0'+(value%10);
+		value /= 10;
+		i++;
+	}
+	buffer[i] = '\0';
+	
+	for (int j = 0; j < i/2; j++) {
+		auto temp = buffer[j];
+		buffer[j] = buffer[i-j-1];
+		buffer[i-j-1] = temp;
+	}
+}
+
+char HEX_NUMS[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+
+void u64_to_hex(uint64_t value, char* buffer) {
+	int n = 18; 
+	buffer[n--] = '\0';
+	
+	for (int i = 0; i < 16; ++i) {
+		uint8_t digit = value & 0xF;
+		buffer[n--] = HEX_NUMS[digit];
+		value >>= 4;
+	}
+	buffer[n--] = 'x';
+	buffer[n--] = '0';
+}
+
+void draw_char(int x, int y, char c, uint32_t color) {
+	const uint8_t* glyph = font8x8_basic[(int)c];
+	for (int row = 0; row < 8; row++) {
+		uint8_t bits = glyph[row];
+		for (int col = 0; col < 8; col++) {
+			if (bits & (1 << col))
+				putp(x + col, y + row, color);
+		}
+	}
+}
+
+int current_print_line = 0;
+
+void print(char* buffer) {
+	uint64_t i = 0;
+	while (true) {
+		char c = buffer[i];
+		if (c == '\0') {
+			break;
+		}
+		draw_char(i*8, current_print_line*10, c, 0xFFFFFFFF);
+		i++;
+	}
+	
+	current_print_line ++;
+}
+
+
 
 
 
@@ -223,7 +319,9 @@ static inline uint64_t read_cr3() {
 }
 
 static uint64_t next_free_phys_page = 0;
+static uint64_t max_free_phys_page = 0;
 const uint64_t GUARD = 2*1024*1024; // 2 MiB guard
+static uint64_t max_hhdm_size = 0;
 
 void init_physical_allocator() {
 	auto memmap = memmap_req.response;
@@ -234,16 +332,38 @@ void init_physical_allocator() {
 		auto *entry = memmap->entries[i];
 		if (entry->type == LIMINE_MEMMAP_USABLE && entry->length > best_len && entry->base > GUARD) {
 			best_len = entry->length;
-			best_base = entry->base  +  PAGE_SIZE - entry->base%PAGE_SIZE;
+			best_base = (entry->base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+		}
+		if (entry->length + entry->base > max_hhdm_size) {
+			max_hhdm_size = entry->length + entry->base;
 		}
 	}
 
 	next_free_phys_page = best_base;
+	max_free_phys_page = best_base+best_len;
+	
+//	if (debug) {
+	char str[64];
+	
+	u64_to_hex(next_free_phys_page, str);
+	print("Next free phys page");
+	print(str);
+	
+	u64_to_hex(max_free_phys_page, str);
+	print("Max free phys page");
+	print(str);
+//	}
 }
 
 uint64_t alloc_phys_page() {
+	if (next_free_phys_page >= max_free_phys_page) {
+		print("OUT OF MEMORY!");
+		hcf();
+	}
+	
 	uint64_t addr = next_free_phys_page;
 	next_free_phys_page += PAGE_SIZE;
+	
 	return addr;
 }
 
@@ -276,29 +396,38 @@ void map_page(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
 	auto walk_level = [&](volatile uint64_t* table, uint64_t index) -> volatile uint64_t* {
 		if (!(table[index] & PRESENT)) {
 			uint64_t new_phys = alloc_phys_page();
-			volatile uint64_t* new_virt = (uint64_t*)(HHDM + new_phys);
-			for (int i = 0; i < 512; ++i) new_virt[i] = 0;
-			table[index] = (new_phys & 0x000ffffffffff000ULL) | PRESENT | WRITABLE | GLOBAL;
+			volatile uint64_t* new_virt = (volatile uint64_t*)(HHDM + new_phys);
+			
+			for (int i = 0; i < 512; ++i) new_virt[i] = 0ULL;
+			table[index] = (new_phys & 0x000ffffffffff000ULL) | PRESENT | WRITABLE;
 			return new_virt;
 		} else {
 			uint64_t next_phys = table[index] & 0x000ffffffffff000ULL;
-			return (volatile uint64_t*)(HHDM + next_phys);
+			auto val = (volatile uint64_t*)(HHDM + next_phys);
+			return val;
 		}
 	};
-
+	
 	volatile uint64_t* pdpt = walk_level(pml4, PML4_INDEX(virt_addr));
 	volatile uint64_t* pd   = walk_level(pdpt, PDPT_INDEX(virt_addr));
 	volatile uint64_t* pt   = walk_level(pd, PD_INDEX(virt_addr));
-
+	
 	// finally, create the leaf entry
 	pt[PT_INDEX(virt_addr)] = (phys_addr & 0x000ffffffffff000ULL) | (flags | PRESENT);
+	
 	// and invalidate the virtual address to update the cpu's cache
 	invlpg(virt_addr);
 }
 
 void map_ecam_region(uint64_t phys_base, uint64_t virt_base, uint64_t size) {
 	for (uint64_t offset = 0; offset < size; offset += 0x1000) {
-		map_page(virt_base + offset, phys_base + offset, WRITABLE | CACHE_DISABLE | WRITE_THROUGH | NX);
+		map_page(virt_base + offset, phys_base + offset, WRITABLE | CACHE_DISABLE | WRITE_THROUGH);
+	}
+}
+
+void map_mmio_region(uint64_t phys_base, uint64_t virt_base, uint64_t size) {
+	for (uint64_t offset = 0; offset < size; offset += 0x1000) {
+		map_page(virt_base + offset, phys_base + offset, WRITABLE | CACHE_DISABLE | WRITE_THROUGH);
 	}
 }
 
@@ -309,69 +438,32 @@ void map_region(uint64_t virt_start, uint64_t phys_start, size_t length, uint64_
 	}
 }
 
-void u64_to_str(uint64_t value, char* buffer) {
-	if (value == 0) {
-		buffer[0] = '0';
-		buffer[1] = '\0';
-		return;
-	}
-	
-	int i = 0;
-	while (value > 0) {
-		buffer[i] = '0'+(value%10);
-		value /= 10;
-		i++;
-	}
-	buffer[i] = '\0';
-	
-	for (int j = 0; j < i/2; j++) {
-		auto temp = buffer[j];
-		buffer[j] = buffer[i-j-1];
-		buffer[i-j-1] = temp;
-	}
-}
-
-void draw_char(limine_framebuffer* fb, int x, int y, char c, uint32_t color) {
-	const uint8_t* glyph = font8x8_basic[(int)c];
-	for (int row = 0; row < 8; row++) {
-		uint8_t bits = glyph[row];
-		for (int col = 0; col < 8; col++) {
-			if (bits & (1 << col))
-				putp(fb, x + col, y + row, color);
-		}
-	}
-}
-
-int current_print_line = 0;
-
-void print(limine_framebuffer *fb, char* buffer) {
-	uint64_t i = 0;
-	while (true) {
-		char c = buffer[i];
-		if (c == '\0') {
-			break;
-		}
-		draw_char(fb, i*8, current_print_line*10, c, 0xFFFFFFFF);
-		i++;
-	}
-	
-	current_print_line ++;
-}
+struct __attribute__((packed)) XHCICapRegs {
+	uint8_t caplength;
+	uint8_t reserved;
+	uint16_t hciversion;
+	uint32_t hcsparams1;
+	uint32_t hcsparams2;
+	uint32_t hcsparams3;
+	uint32_t hccparams1;
+	uint32_t dboff;
+	uint32_t rtsoff;
+};
 
 extern "C" void kmain(void) {
 	// frame buffer
 	if (!LIMINE_BASE_REVISION_SUPPORTED) hcf();
 	if (!fb_req.response || fb_req.response->framebuffer_count < 1) hcf();
 	
-	struct limine_framebuffer *fb = fb_req.response->framebuffers[0];
+	fb = fb_req.response->framebuffers[0];
 	
 	if (!memmap_req.response) {
-		print(fb, "No memmap response");
+		print("No memmap response");
 		hcf();
 	}
 	
 	if (!hhdm_req.response) {
-		print(fb, "No hhdm response");
+		print("No hhdm response");
 		hcf();
 	}
 	
@@ -381,6 +473,7 @@ extern "C" void kmain(void) {
 	
 	// Let's go map the memmory
 	init_physical_allocator();
+	map_region(HHDM, 0, max_hhdm_size, PRESENT | WRITABLE);
 	
 	// time to go find the pcie
 	
@@ -405,7 +498,7 @@ extern "C" void kmain(void) {
 	}
 	
 	if (!valid_signature) {
-		print(fb, "No valid signature for rsd ptr");
+		print("No valid signature for rsd ptr");
 		hcf();
 	}
 	
@@ -438,7 +531,7 @@ extern "C" void kmain(void) {
 	}
 	
 	if (!valid_signature) {
-		print(fb, "No valid signature for rsdt");
+		print("No valid signature for rsdt");
 		hcf();
 	}
 	
@@ -472,30 +565,40 @@ extern "C" void kmain(void) {
 		str[3] = entry[3];
 		str[4] = '\0';
 	
-//		print(fb, str);
+//		print(str);
 		if (str[0] == 'M' && str[1] == 'C' && str[2] == 'F' && str[3] == 'G') {
-//			print(fb, "Found it!");
+//			print("Found it!");
 			ptr_mcfg = entry;
 			break;
 		}
 	}
 	
 	if (ptr_mcfg == 0) {
-		print(fb, "Ptr mcfg == 0");
+		print("Ptr mcfg == 0");
 		hcf();
 	}
 	
 	// now we have ptr_mcfg
+	#define PCI_ECAM_VA_BASE    0xFFFF'8000'0000'0000ULL  // pick a canonical kernel VA
+	#define PCI_ECAM_SEG_STRIDE            0x10000000ULL            // 256 MiB
 	
-	#define PCI_ECAM_VA_BASE   0xFFFF'8000'0000'0000ULL  // pick a canonical kernel VA
-	#define PCI_ECAM_SEG_STRIDE 0x10000000ULL            // 256 MiB
+	// Example: a simple PCIe MMIO window in higher half
+	#define PCI_MMIO_VA_BASE           0xFFFF'9000'0000'0000ULL  // canonical
+	#define USB_VA_BASE      (PCI_MMIO_VA_BASE + 0x0010'0000ULL) // leave some gap
+	
 	
 	volatile struct MCFGHeader *mcfg = (volatile struct MCFGHeader *)ptr_mcfg;
 	
 	uint32_t length = mcfg->header.length;
 	uint32_t entries = (length - sizeof(struct ACPISDTHeader) - 8) / 16;  // 16 bytes per entry
 	
-	bool foundit = false;
+	uint64_t usb_virt_base;
+	uint8_t usb_start;
+	uint8_t usb_bus;
+	uint8_t usb_dev;
+	uint8_t usb_fn;
+	uint8_t usb_prog_if;
+	bool usb_found = false;
 	
 	for (uint32_t i = 0; i < entries; i++) {
 		auto *e = &mcfg->entries[i];
@@ -505,23 +608,21 @@ extern "C" void kmain(void) {
 		uint8_t start = e->start_bus;
 		uint8_t end   = e->end_bus;
 		
-		print(fb, "nice - let's map this shit");
+		print("nice - let's map this shit");
 		
 		uint64_t ecam_size = (uint64_t)(end - start + 1) * 0x100000ULL; // 1MiB per bus
 		uint64_t virt_base = PCI_ECAM_VA_BASE + (uint64_t)seg * PCI_ECAM_SEG_STRIDE;
 		// Map MMIO as UC:
 		map_ecam_region(phys_base, virt_base, ecam_size);
-		print(fb, "Mapped!");
+		print("Mapped!");
 		
 		for (uint8_t bus = start; bus < end; bus++) {
 			for (uint8_t dev = 0; dev < 32; dev++) {
 				for (uint8_t fn = 0; fn < 8; fn++) {
-					volatile uint32_t* vendor_device = pci_cfg_ptr(virt_base, start, bus, dev, fn, 0x00);
-					uint32_t id = *vendor_device;
+					uint32_t id = pci_cfg_read32(virt_base, start, bus, dev, fn, 0x00);
 					if (id == 0xFFFFFFFF) continue; // no device present
 					
-					volatile uint32_t* classcode = pci_cfg_ptr(virt_base, start, bus, dev, fn, 0x08);
-					uint32_t class_reg = *classcode;
+					uint32_t class_reg = pci_cfg_read32(virt_base, start, bus, dev, fn, 0x08);
 					
 					uint8_t baseclass = (class_reg >> 24) & 0xFF;
 					uint8_t subclass  = (class_reg >> 16) & 0xFF;
@@ -529,8 +630,15 @@ extern "C" void kmain(void) {
 					
 					if (baseclass == 0x0C && subclass == 0x03) {
 						// USB controller detected!
-						foundit = true;
-						print(fb, "Found a USB controller!");
+						usb_virt_base = virt_base;
+						usb_start = start;
+						usb_bus = bus;
+						usb_dev = dev;
+						usb_fn = fn;
+						usb_prog_if = prog_if;
+						usb_found = true;
+						print("Found a USB controller!");
+						
 						break;
 						// You can optionally differentiate:
 						// if (prog_if == 0x30) -> XHCI
@@ -540,15 +648,87 @@ extern "C" void kmain(void) {
 		}
 	}
 	
+	if (!usb_found) {
+		print("Could not find a USB controller!");
+		hcf();
+	}
 	
-//	if (!foundit) {
-//		fill_screen_fast(fb, bad);
-//		hcf();
-//	}
-//	
-//	
-//	
-//	fill_screen_fast(fb, good);
-	print(fb, "All good yo");
+	
+	char str[64];
+	u64_to_hex(usb_prog_if, str);
+	print("Prog_If:");
+	print(str);
+	
+	if (usb_prog_if != 0x30) {
+		print("Unsupported USB protocol.");
+		hcf();
+	}
+	
+	// now that we have the usb device here, we need to identify the location of the bar addresses.
+	// essentially a bar is a register holding the loaction that will store the space in which we will communicate with the device.
+	// usb uses 1, so does nvme ssd. However, network might use more than one, vga/gpu will use several. Right now let's focus only on usb
+	
+	uint32_t bar0_low  = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10);
+	uint32_t bar1_high = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x14);
+	
+	uint64_t bar_addr = ((uint64_t)bar1_high << 32) | (bar0_low & ~0xFULL);
+	
+	print("Got the bar addr...");
+	u64_to_hex(bar_addr, str);
+	print(str);
+	
+	
+	
+	uint16_t before = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
+	print("Before CMD: "); u64_to_hex(before, str); print(str);
+	
+	pci_cfg_write16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04, before | (1 << 1));
+	uint16_t after = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
+	print("After CMD: "); u64_to_hex(after, str); print(str);
+	
+//	// this does... something
+//	uint16_t cmd = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
+//	cmd |= (1 << 1); // enable MMIO
+//	pci_cfg_write16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04, cmd);
+	
+	// Save old value
+	pci_cfg_write32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10, 0xFFFFFFFF);
+	uint32_t size_mask = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10);
+	pci_cfg_write32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10, bar0_low); // restore
+	
+	print("Got the size mask...");
+	u64_to_hex(size_mask, str);
+	print(str);
+	
+	uint64_t mmio_size = ~(size_mask & ~0xF) + 1;
+	
+	print("Got the mmio size...");
+	u64_to_hex(mmio_size, str);
+	print(str);
+	
+//	debug = true;
+	map_mmio_region(bar_addr, USB_VA_BASE, mmio_size);
+	
+	print("Mapped USB");
+	
+	uint32_t info = *(volatile uint32_t*)USB_VA_BASE;
+	u64_to_hex(info, str); print(str);
+	
+	u64_to_hex((info>>16)&0xFFFF, str); print(str);
+	
+	uint32_t cap_len = (info & 0xFF);
+	uint32_t ver = (info>>16) & 0xFFFF;
+	
+	print("Cap len: ");
+	u64_to_str(cap_len, str);
+	print(str);
+	
+	print("XHCI found, version: ");
+	u64_to_str(ver, str);
+	print(str);
+	
+	
+	
+	print("Finished.");
 	hcf();
 }
