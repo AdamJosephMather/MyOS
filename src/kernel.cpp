@@ -1,7 +1,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-//#include "image_data.h"
+#include "font8x8_basic.h"
 
 extern "C" {
 	#include "../limine.h"
@@ -158,86 +158,7 @@ static inline void outl(uint16_t port, uint32_t val) {
 
 
 
-// Implements a simple memory set function
-//void *memset(void *s, int c, size_t n) {
-//	volatile uint8_t *p = (volatile uint8_t *)s; // Treat the memory block as an array of bytes
-//	
-//	// Loop 'n' times, setting each byte to the value 'c'
-//	for (size_t i = 0; i < n; i++) {
-//		p[i] = (uint8_t)c;
-//	}
-//	return s;
-//}
-
-//#define PAGE_SIZE 4096
-//
-//static inline uint64_t round_up(uint64_t x, uint64_t a)   { return (x + a - 1) & ~(a - 1); }
-//static inline uint64_t round_down(uint64_t x, uint64_t a) { return x & ~(a - 1); }
-//
-//static void bitmap_set_range(uint8_t *bm, uint64_t first_page, uint64_t page_count, bool used) {
-////	set/clear bits [first_page, first_page+page_count)
-//	uint64_t p = first_page, end = first_page + page_count;
-//	while (p < end) {
-//		if (used) bm[p >> 3] |=  (1u << (p & 7));
-//		else      bm[p >> 3] &= ~(1u << (p & 7));
-//		++p;
-//	}
-//}
-//
-//void init_phys_allocator() {
-//	// 1) size
-//	uint64_t highest = 0;
-//	for (size_t i = 0; i < memmap_req.response->entry_count; ++i) {
-//		auto *e = memmap_req.response->entries[i];
-//		uint64_t end = e->base + e->length;
-//		if (end > highest) highest = end;
-//	}
-//	
-//	uint64_t total_pages = round_up(highest, PAGE_SIZE) / PAGE_SIZE;
-//	uint64_t bitmap_size = round_up((total_pages + 7) / 8, 8); // byte-align
-//
-//	// 2) place bitmap in a USABLE region
-//	uint64_t bitmap_pa = 0;
-//	for (size_t i = 0; i < memmap_req.response->entry_count; ++i) {
-//		auto *e = memmap_req.response->entries[i];
-//		if (e->type != LIMINE_MEMMAP_USABLE) continue;
-//
-//		uint64_t start = e->base < 0x100000 ? 0x100000 : e->base; // avoid <1MiB
-//		uint64_t aligned = round_up(start, PAGE_SIZE);
-//		if (aligned + bitmap_size <= e->base + e->length) {
-//			bitmap_pa = aligned;
-//			break;
-//		}
-//	}
-//	if (!bitmap_pa) hcf();
-//
-//	// 3) VA for bitmap via HHDM
-//	uint8_t *bm = (uint8_t *)(HHDM + bitmap_pa);
-//
-//	// 4) init: mark everything used
-//	for (uint64_t i = 0; i < bitmap_size; ++i) bm[i] = 0xFF;
-//
-//	// 5) free USABLE ranges; reserve others
-//	for (size_t i = 0; i < memmap_req.response->entry_count; ++i) {
-//		auto *e = memmap_req.response->entries[i];
-//
-//		uint64_t base = round_down(e->base, PAGE_SIZE);
-//		uint64_t end  = round_up(e->base + e->length, PAGE_SIZE);
-//		uint64_t pages = (end - base) / PAGE_SIZE;
-//
-//		bool usable = (e->type == LIMINE_MEMMAP_USABLE);
-//		bitmap_set_range(bm, base / PAGE_SIZE, pages, !usable);
-//	}
-//
-//	// 6) explicitly reserve the bitmap itself
-//	bitmap_set_range(bm, bitmap_pa / PAGE_SIZE, round_up(bitmap_size, PAGE_SIZE)/PAGE_SIZE, true);
-//
-//	// TODO: also reserve:
-//	// - kernel image phys range
-//	// - initial page tables
-//	// - stacks
-//	// - framebuffer (device memory)
-//}
+#define PCI_ECAM_VIRT_BASE 0xFFFF900000000000ULL
 
 struct ACPISDTHeader {
 	char     signature[4];
@@ -249,58 +170,195 @@ struct ACPISDTHeader {
 	uint32_t oem_revision;
 	uint32_t creator_id;
 	uint32_t creator_revision;
-};
+} __attribute__((packed));
+
+struct MCFGEntry {
+	uint64_t base_address;
+	uint16_t pci_segment_group;
+	uint8_t  start_bus;
+	uint8_t  end_bus;
+	uint32_t reserved;
+} __attribute__((packed));
 
 struct MCFGHeader {
-	struct ACPISDTHeader header;   // the same 36-byte header you already know
-	uint64_t reserved;             // always 0
-	struct {
-		uint64_t base_address;     // physical base of PCIe config space
-		uint16_t segment_group;
-		uint8_t  bus_start;
-		uint8_t  bus_end;
-		uint32_t reserved2;
-	} entries[];                   // one or more of these
-};
+	struct ACPISDTHeader header;
+	uint64_t reserved;           // <-- required padding
+	struct MCFGEntry entries[];
+} __attribute__((packed));
 
+// returns a DWORD pointer in ECAM
+inline volatile uint32_t* pci_cfg_ptr(uint64_t virt_base,
+									  uint8_t start_bus,
+									  uint8_t bus, uint8_t dev, uint8_t fn,
+									  uint16_t off) {
+	// ECAM: 1MiB per bus, 32 devs, 8 funcs, 4KiB per fn
+	// Validate offset is DWORD-aligned and within 4KiB
+	// (you can drop these checks in release):
+	if ((off & 3) || off > 0xFFC) hcf();
 
-uint64_t pci_get_config_va(uint64_t base, uint8_t bus, uint8_t device, uint8_t function) {
-	uint64_t offset = ((uint64_t)bus << 20) | ((uint64_t)device << 15) | ((uint64_t)function << 12);
-	return HHDM + base + offset;
+	uint64_t addr = virt_base
+				  + ((uint64_t)(bus - start_bus) << 20)  // (bus - start)*1MiB
+				  + ((uint64_t)dev << 15)                // dev*32*4KiB
+				  + ((uint64_t)fn  << 12)                // fn*4KiB
+				  + off;
+
+	return (volatile uint32_t*)addr;  // DO NOT add PCI_ECAM_VIRT_BASE again
 }
 
-bool find_usb_controller(uint64_t base, uint8_t start_bus, uint8_t end_bus) {
-	for (uint8_t bus = start_bus; bus <= end_bus; bus++) {
-		for (uint8_t dev = 0; dev < 32; dev++) {
-			for (uint8_t func = 0; func < 8; func++) {
-				uint64_t cfg_va = pci_get_config_va(base, bus, dev, func);
-				volatile uint8_t *cfg = (volatile uint8_t *)cfg_va;
 
-				uint16_t vendor_id = *(volatile uint16_t *)(cfg + 0x00);
-				if (vendor_id == 0xFFFF) continue;  // empty slot
 
-				uint8_t class_code = *(volatile uint8_t *)(cfg + 0x0B);
-				uint8_t subclass   = *(volatile uint8_t *)(cfg + 0x0A);
 
-				if (class_code == 0x0C && subclass == 0x03) {
-					// USB controller found
-					return true;
-				}
 
-				// check if multi-function
-				if (func == 0 && !(*(volatile uint8_t *)(cfg + 0x0E) & 0x80))
-					break; // single-function device → skip rest
-			}
+
+
+
+
+
+#define PAGE_SIZE 0x1000
+
+static inline uint64_t read_cr3() {
+	uint64_t value;
+	asm volatile ("mov %%cr3, %0" : "=r"(value));
+	return value;
+}
+
+static uint64_t next_free_phys_page = 0;
+const uint64_t GUARD = 2*1024*1024; // 2 MiB guard
+
+void init_physical_allocator() {
+	auto memmap = memmap_req.response;
+	uint64_t best_len = 0;
+	uint64_t best_base = 0;
+
+	for (uint64_t i = 0; i < memmap->entry_count; i++) {
+		auto *entry = memmap->entries[i];
+		if (entry->type == LIMINE_MEMMAP_USABLE && entry->length > best_len && entry->base > GUARD) {
+			best_len = entry->length;
+			best_base = entry->base  +  PAGE_SIZE - entry->base%PAGE_SIZE;
 		}
 	}
-	return false;
+
+	next_free_phys_page = best_base;
+}
+
+uint64_t alloc_phys_page() {
+	uint64_t addr = next_free_phys_page;
+	next_free_phys_page += PAGE_SIZE;
+	return addr;
+}
+
+#define PML4_INDEX(va) (((va) >> 39) & 0x1FF)
+#define PDPT_INDEX(va) (((va) >> 30) & 0x1FF)
+#define PD_INDEX(va)   (((va) >> 21) & 0x1FF)
+#define PT_INDEX(va)   (((va) >> 12) & 0x1FF)
+
+enum PageFlags : uint64_t {
+	PRESENT  = 1ULL << 0,
+	WRITABLE = 1ULL << 1,
+	USER     = 1ULL << 2,
+	WRITE_THROUGH = 1ULL << 3,
+	CACHE_DISABLE = 1ULL << 4,
+	ACCESSED = 1ULL << 5,
+	DIRTY    = 1ULL << 6,
+	HUGE     = 1ULL << 7,
+	GLOBAL   = 1ULL << 8,
+	NX       = 1ULL << 63
+};
+
+static inline void invlpg(uint64_t addr) {
+	asm volatile("invlpg (%0)" :: "r"(addr) : "memory");
+}
+
+void map_page(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
+	uint64_t cr3 = read_cr3();
+	volatile uint64_t* pml4 = (uint64_t*)(HHDM + (cr3 & 0x000ffffffffff000ULL));
+
+	auto walk_level = [&](volatile uint64_t* table, uint64_t index) -> volatile uint64_t* {
+		if (!(table[index] & PRESENT)) {
+			uint64_t new_phys = alloc_phys_page();
+			volatile uint64_t* new_virt = (uint64_t*)(HHDM + new_phys);
+			for (int i = 0; i < 512; ++i) new_virt[i] = 0;
+			table[index] = (new_phys & 0x000ffffffffff000ULL) | PRESENT | WRITABLE | GLOBAL;
+			return new_virt;
+		} else {
+			uint64_t next_phys = table[index] & 0x000ffffffffff000ULL;
+			return (volatile uint64_t*)(HHDM + next_phys);
+		}
+	};
+
+	volatile uint64_t* pdpt = walk_level(pml4, PML4_INDEX(virt_addr));
+	volatile uint64_t* pd   = walk_level(pdpt, PDPT_INDEX(virt_addr));
+	volatile uint64_t* pt   = walk_level(pd, PD_INDEX(virt_addr));
+
+	// finally, create the leaf entry
+	pt[PT_INDEX(virt_addr)] = (phys_addr & 0x000ffffffffff000ULL) | (flags | PRESENT);
+	// and invalidate the virtual address to update the cpu's cache
+	invlpg(virt_addr);
+}
+
+void map_ecam_region(uint64_t phys_base, uint64_t virt_base, uint64_t size) {
+	for (uint64_t offset = 0; offset < size; offset += 0x1000) {
+		map_page(virt_base + offset, phys_base + offset, WRITABLE | CACHE_DISABLE | WRITE_THROUGH | NX);
+	}
+}
+
+void map_region(uint64_t virt_start, uint64_t phys_start, size_t length, uint64_t flags) {
+	size_t pages = (length + 0xFFF) / 0x1000;
+	for (size_t i = 0; i < pages; i++) {
+		map_page(virt_start + i * 0x1000, phys_start + i * 0x1000, flags);
+	}
+}
+
+void u64_to_str(uint64_t value, char* buffer) {
+	if (value == 0) {
+		buffer[0] = '0';
+		buffer[1] = '\0';
+		return;
+	}
+	
+	int i = 0;
+	while (value > 0) {
+		buffer[i] = '0'+(value%10);
+		value /= 10;
+		i++;
+	}
+	buffer[i] = '\0';
+	
+	for (int j = 0; j < i/2; j++) {
+		auto temp = buffer[j];
+		buffer[j] = buffer[i-j-1];
+		buffer[i-j-1] = temp;
+	}
+}
+
+void draw_char(limine_framebuffer* fb, int x, int y, char c, uint32_t color) {
+	const uint8_t* glyph = font8x8_basic[(int)c];
+	for (int row = 0; row < 8; row++) {
+		uint8_t bits = glyph[row];
+		for (int col = 0; col < 8; col++) {
+			if (bits & (1 << col))
+				putp(fb, x + col, y + row, color);
+		}
+	}
+}
+
+int current_print_line = 0;
+
+void print(limine_framebuffer *fb, char* buffer) {
+	uint64_t i = 0;
+	while (true) {
+		char c = buffer[i];
+		if (c == '\0') {
+			break;
+		}
+		draw_char(fb, i*8, current_print_line*10, c, 0xFFFFFFFF);
+		i++;
+	}
+	
+	current_print_line ++;
 }
 
 extern "C" void kmain(void) {
-	auto good = toARGB(255, 0, 255, 0);
-	auto bad = toARGB(255, 255, 0, 0);
-	auto ehhm = toARGB(255, 0, 255, 255);
-	
 	// frame buffer
 	if (!LIMINE_BASE_REVISION_SUPPORTED) hcf();
 	if (!fb_req.response || fb_req.response->framebuffer_count < 1) hcf();
@@ -308,12 +366,12 @@ extern "C" void kmain(void) {
 	struct limine_framebuffer *fb = fb_req.response->framebuffers[0];
 	
 	if (!memmap_req.response) {
-		fill_screen_fast(fb, bad);
+		print(fb, "No memmap response");
 		hcf();
 	}
 	
 	if (!hhdm_req.response) {
-		fill_screen_fast(fb, bad);
+		print(fb, "No hhdm response");
 		hcf();
 	}
 	
@@ -321,13 +379,14 @@ extern "C" void kmain(void) {
 	// HHDM + PA = VA
 	
 	
+	// Let's go map the memmory
+	init_physical_allocator();
+	
+	// time to go find the pcie
 	
 	// RSDP table (will point to the thing needed to find PCIe)
 	if (!rsdp_req.response) hcf();
 	uint64_t rsdp_va = (uint64_t)rsdp_req.response->address;
-	
-//	uint64_t rsdp_va = HHDM+rsdp_physical_address;
-	
 	
 	
 	
@@ -346,7 +405,7 @@ extern "C" void kmain(void) {
 	}
 	
 	if (!valid_signature) {
-		fill_screen_fast(fb, bad);
+		print(fb, "No valid signature for rsd ptr");
 		hcf();
 	}
 	
@@ -379,7 +438,7 @@ extern "C" void kmain(void) {
 	}
 	
 	if (!valid_signature) {
-		fill_screen_fast(fb, bad);
+		print(fb, "No valid signature for rsdt");
 		hcf();
 	}
 	
@@ -405,20 +464,31 @@ extern "C" void kmain(void) {
 	
 		uint64_t entry_va = HHDM + (uint64_t)entry_pa;
 		volatile uint8_t *entry = (volatile uint8_t *)entry_va;
+		
+		char str[5];
+		str[0] = entry[0];
+		str[1] = entry[1];
+		str[2] = entry[2];
+		str[3] = entry[3];
+		str[4] = '\0';
 	
-		// compare signature
-		if (entry[0]=='M' && entry[1]=='C' && entry[2]=='F' && entry[3]=='G') {
+//		print(fb, str);
+		if (str[0] == 'M' && str[1] == 'C' && str[2] == 'F' && str[3] == 'G') {
+//			print(fb, "Found it!");
 			ptr_mcfg = entry;
 			break;
 		}
 	}
 	
 	if (ptr_mcfg == 0) {
-		fill_screen_fast(fb, bad);
+		print(fb, "Ptr mcfg == 0");
 		hcf();
 	}
 	
 	// now we have ptr_mcfg
+	
+	#define PCI_ECAM_VA_BASE   0xFFFF'8000'0000'0000ULL  // pick a canonical kernel VA
+	#define PCI_ECAM_SEG_STRIDE 0x10000000ULL            // 256 MiB
 	
 	volatile struct MCFGHeader *mcfg = (volatile struct MCFGHeader *)ptr_mcfg;
 	
@@ -430,96 +500,55 @@ extern "C" void kmain(void) {
 	for (uint32_t i = 0; i < entries; i++) {
 		auto *e = &mcfg->entries[i];
 		
-		if (find_usb_controller(e->base_address, e->bus_start, e->bus_end)) {
-			foundit = true;
-			break;
+		uint64_t phys_base = e->base_address;
+		uint16_t seg  = e->pci_segment_group;
+		uint8_t start = e->start_bus;
+		uint8_t end   = e->end_bus;
+		
+		print(fb, "nice - let's map this shit");
+		
+		uint64_t ecam_size = (uint64_t)(end - start + 1) * 0x100000ULL; // 1MiB per bus
+		uint64_t virt_base = PCI_ECAM_VA_BASE + (uint64_t)seg * PCI_ECAM_SEG_STRIDE;
+		// Map MMIO as UC:
+		map_ecam_region(phys_base, virt_base, ecam_size);
+		print(fb, "Mapped!");
+		
+		for (uint8_t bus = start; bus < end; bus++) {
+			for (uint8_t dev = 0; dev < 32; dev++) {
+				for (uint8_t fn = 0; fn < 8; fn++) {
+					volatile uint32_t* vendor_device = pci_cfg_ptr(virt_base, start, bus, dev, fn, 0x00);
+					uint32_t id = *vendor_device;
+					if (id == 0xFFFFFFFF) continue; // no device present
+					
+					volatile uint32_t* classcode = pci_cfg_ptr(virt_base, start, bus, dev, fn, 0x08);
+					uint32_t class_reg = *classcode;
+					
+					uint8_t baseclass = (class_reg >> 24) & 0xFF;
+					uint8_t subclass  = (class_reg >> 16) & 0xFF;
+					uint8_t prog_if   = (class_reg >> 8) & 0xFF;
+					
+					if (baseclass == 0x0C && subclass == 0x03) {
+						// USB controller detected!
+						foundit = true;
+						print(fb, "Found a USB controller!");
+						break;
+						// You can optionally differentiate:
+						// if (prog_if == 0x30) -> XHCI
+					}
+				}
+			}
 		}
 	}
 	
-	if (!foundit) {
-		fill_screen_fast(fb, bad);
-		hcf();
-	}
 	
-	
-	
-	fill_screen_fast(fb, good);
-	
-	
-	
-	
-	
-	
-//	init_phys_allocator();
-	
-	
-	
-	
-	
-	
-	
-//	auto white = toARGB(255, 255, 255, 255);
-//	auto black = toARGB(255, 0, 0, 0);
-//	
-//	while (true) {
-//	auto w = fb->width;
-//	auto h = fb->height;
-//	
-//	for (uint32_t cy = 0; cy < h; cy++) {
-//		uint64_t y = (cy*IMG_H)/h;
-//		
-//		for (uint32_t cx = 0; cx < w; cx++) {
-//			uint64_t x = (cx*IMG_W)/w;
-//			
-//			uint64_t fullindx = (y*IMG_W+x);
-//			uint64_t valindx = fullindx/64;
-//			uint64_t specificindx = 63-fullindx-valindx*64;
-//			
-//			uint64_t val = img[valindx];
-//			bool iswhite = ((val >> specificindx) & 1) == 1;
-//			
-//			if (iswhite) {
-//				putp(fb, cx, cy, white);
-//			}else{
-//				putp(fb, cx, cy, black);
-//			}
-//		}
+//	if (!foundit) {
+//		fill_screen_fast(fb, bad);
+//		hcf();
 //	}
-//	}
-	
-	
-//	uint8_t red = 0;
-//	uint8_t green = 0;
-//	uint8_t blue = 0;
 //	
-//	KeyState ks{};
-//	fill_screen_fast(fb, toARGB(255, red, green, blue));
 //	
-//	while (true) {
-//		if (canGetKey()) {
-//			uint8_t scancode = readScancode();
-//			char c = scancode_to_char(scancode, ks);
-//			
-//			if (c == 'r') {
-//				red += 10;
-//			}else if (c == 'g') {
-//				green += 10;
-//			}else if (c == 'b') {
-//				blue += 10;
-//			}else if (c == 'R') {
-//				red -= 10;
-//			}else if (c == 'G') {
-//				green -= 10;
-//			}else if (c == 'B') {
-//				blue -= 10;
-//			}else if (c == 'q') {
-//				break;
-//			}
-//			
-//			fill_screen_fast(fb, toARGB(255, red, green, blue));
-//		}
-//	}
-	
-	
+//	
+//	fill_screen_fast(fb, good);
+	print(fb, "All good yo");
 	hcf();
 }

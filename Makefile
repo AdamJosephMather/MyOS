@@ -6,7 +6,7 @@ CFLAGS=-O2 -g -ffreestanding -fno-stack-protector -mno-red-zone -mcmodel=kernel 
 CXXFLAGS=$(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti
 LDFLAGS=-nostdlib -z max-page-size=0x1000
 
-SRC=src/kernel.cpp src/image_data.cpp
+SRC=src/kernel.cpp
 OBJ=$(SRC:.cpp=.o)
 
 all: myos
@@ -39,7 +39,13 @@ run: iso
 		-machine q35 \
 		-m 512M \
 		-bios OVMF.fd \
-		-cdrom myos.iso
+		-cdrom myos.iso \
+		-no-reboot \
+		-no-shutdown \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd \
+		-device usb-mouse
+	
 
 
 clean:
