@@ -389,34 +389,64 @@ static inline void invlpg(uint64_t addr) {
 	asm volatile("invlpg (%0)" :: "r"(addr) : "memory");
 }
 
-void map_page(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
-	uint64_t cr3 = read_cr3();
-	volatile uint64_t* pml4 = (uint64_t*)(HHDM + (cr3 & 0x000ffffffffff000ULL));
+#define PTE_ADDR_MASK     0x000ffffffffff000ULL
+#define PD_2M_ADDR_MASK   0x000ffffffe00000ULL
+#define PDP_1G_ADDR_MASK  0x000fffffc0000000ULL
 
-	auto walk_level = [&](volatile uint64_t* table, uint64_t index) -> volatile uint64_t* {
-		if (!(table[index] & PRESENT)) {
-			uint64_t new_phys = alloc_phys_page();
-			volatile uint64_t* new_virt = (volatile uint64_t*)(HHDM + new_phys);
-			
-			for (int i = 0; i < 512; ++i) new_virt[i] = 0ULL;
-			table[index] = (new_phys & 0x000ffffffffff000ULL) | PRESENT | WRITABLE;
-			return new_virt;
-		} else {
-			uint64_t next_phys = table[index] & 0x000ffffffffff000ULL;
-			auto val = (volatile uint64_t*)(HHDM + next_phys);
-			return val;
-		}
-	};
-	
-	volatile uint64_t* pdpt = walk_level(pml4, PML4_INDEX(virt_addr));
-	volatile uint64_t* pd   = walk_level(pdpt, PDPT_INDEX(virt_addr));
-	volatile uint64_t* pt   = walk_level(pd, PD_INDEX(virt_addr));
-	
-	// finally, create the leaf entry
-	pt[PT_INDEX(virt_addr)] = (phys_addr & 0x000ffffffffff000ULL) | (flags | PRESENT);
-	
-	// and invalidate the virtual address to update the cpu's cache
-	invlpg(virt_addr);
+static inline volatile uint64_t *alloc_table(void) {
+	uint64_t phys = alloc_phys_page();
+	volatile uint64_t *virt = (volatile uint64_t *)(HHDM + phys);
+	for (int i = 0; i < 512; i++) virt[i] = 0;
+	return virt;
+}
+
+static inline volatile uint64_t *descend(volatile uint64_t *parent, size_t idx, int level /*3=PDPT,2=PD*/) {
+	uint64_t e = parent[idx];
+
+	// Not present -> allocate next-level table
+	if (!(e & PRESENT)) {
+		volatile uint64_t *child = alloc_table();
+		uint64_t phys = (uint64_t)child - HHDM;
+		parent[idx] = (phys & PTE_ADDR_MASK) | PRESENT | WRITABLE;
+		return child;
+	}
+
+	// Split 1 GiB huge (PDPT->PD)
+	if (level == 3 && (e & HUGE)) {
+		uint64_t flags = e & ~(PTE_ADDR_MASK | HUGE);
+		uint64_t base  = e & PDP_1G_ADDR_MASK;          // 1 GiB-aligned
+		volatile uint64_t *pd = alloc_table();
+		for (int i = 0; i < 512; i++)
+			pd[i] = (base + ((uint64_t)i << 21)) | flags | PRESENT | HUGE;  // 2 MiB each
+		uint64_t phys = (uint64_t)pd - HHDM;
+		parent[idx] = (phys & PTE_ADDR_MASK) | (flags & ~HUGE) | PRESENT | WRITABLE;
+		return pd;
+	}
+
+	// Split 2 MiB huge (PD->PT)
+	if (level == 2 && (e & HUGE)) {
+		uint64_t flags = e & ~(PTE_ADDR_MASK | HUGE);
+		uint64_t base  = e & PD_2M_ADDR_MASK;           // 2 MiB-aligned
+		volatile uint64_t *pt = alloc_table();
+		for (int i = 0; i < 512; i++)
+			pt[i] = (base + ((uint64_t)i << 12)) | flags | PRESENT;         // 4 KiB each
+		uint64_t phys = (uint64_t)pt - HHDM;
+		parent[idx] = (phys & PTE_ADDR_MASK) | (flags & ~HUGE) | PRESENT | WRITABLE;
+		return pt;
+	}
+
+	// Already a pointer to the next level
+	return (volatile uint64_t *)(HHDM + (e & PTE_ADDR_MASK));
+}
+
+void map_page(uint64_t va, uint64_t pa, uint64_t flags) {
+	volatile uint64_t *pml4 = (volatile uint64_t *)(HHDM + (read_cr3() & PTE_ADDR_MASK));
+	volatile uint64_t *pdpt = descend(pml4, PML4_INDEX(va), 4);  // top level is not huge
+	volatile uint64_t *pd   = descend(pdpt, PDPT_INDEX(va), 3);  // split 1 GiB if needed
+	volatile uint64_t *pt   = descend(pd,   PD_INDEX(va),   2);  // split 2 MiB if needed
+
+	pt[PT_INDEX(va)] = (pa & PTE_ADDR_MASK) | (flags | PRESENT);
+	asm volatile("invlpg (%0)" :: "r"(va) : "memory");
 }
 
 void map_ecam_region(uint64_t phys_base, uint64_t virt_base, uint64_t size) {
@@ -433,6 +463,7 @@ void map_mmio_region(uint64_t phys_base, uint64_t virt_base, uint64_t size) {
 
 void map_region(uint64_t virt_start, uint64_t phys_start, size_t length, uint64_t flags) {
 	size_t pages = (length + 0xFFF) / 0x1000;
+	
 	for (size_t i = 0; i < pages; i++) {
 		map_page(virt_start + i * 0x1000, phys_start + i * 0x1000, flags);
 	}
@@ -449,6 +480,13 @@ struct __attribute__((packed)) XHCICapRegs {
 	uint32_t dboff;
 	uint32_t rtsoff;
 };
+
+uint64_t PCI_ECAM_VA_BASE = 0xFFFF'8000'0000'0000ULL; // pick a canonical kernel VA
+uint64_t PCI_ECAM_SEG_STRIDE         = 0x10000000ULL; // 256 MiB
+
+uint64_t PCI_MMIO_VA_BASE = 0xFFFF'9000'0000'0000ULL;  // canonical
+uint64_t USB_VA_BASE = (PCI_MMIO_VA_BASE + 0x0010'0000ULL); // leave some gap
+
 
 extern "C" void kmain(void) {
 	// frame buffer
@@ -472,8 +510,10 @@ extern "C" void kmain(void) {
 	
 	
 	// Let's go map the memmory
+//	init_va_layout();
 	init_physical_allocator();
 	map_region(HHDM, 0, max_hhdm_size, PRESENT | WRITABLE);
+	print("Mapped the entire ram.");
 	
 	// time to go find the pcie
 	
@@ -577,14 +617,6 @@ extern "C" void kmain(void) {
 		print("Ptr mcfg == 0");
 		hcf();
 	}
-	
-	// now we have ptr_mcfg
-	#define PCI_ECAM_VA_BASE    0xFFFF'8000'0000'0000ULL  // pick a canonical kernel VA
-	#define PCI_ECAM_SEG_STRIDE            0x10000000ULL            // 256 MiB
-	
-	// Example: a simple PCIe MMIO window in higher half
-	#define PCI_MMIO_VA_BASE           0xFFFF'9000'0000'0000ULL  // canonical
-	#define USB_VA_BASE      (PCI_MMIO_VA_BASE + 0x0010'0000ULL) // leave some gap
 	
 	
 	volatile struct MCFGHeader *mcfg = (volatile struct MCFGHeader *)ptr_mcfg;
@@ -726,8 +758,6 @@ extern "C" void kmain(void) {
 	print("XHCI found, version: ");
 	u64_to_str(ver, str);
 	print(str);
-	
-	
 	
 	print("Finished.");
 	hcf();
