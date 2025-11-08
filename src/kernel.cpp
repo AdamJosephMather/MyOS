@@ -496,12 +496,12 @@ extern "C" void kmain(void) {
 	fb = fb_req.response->framebuffers[0];
 	
 	if (!memmap_req.response) {
-		print("No memmap response");
+		print("Error: No memmap response");
 		hcf();
 	}
 	
 	if (!hhdm_req.response) {
-		print("No hhdm response");
+		print("Error: No hhdm response");
 		hcf();
 	}
 	
@@ -510,25 +510,20 @@ extern "C" void kmain(void) {
 	
 	
 	// Let's go map the memmory
+	print("Setting up memory management")
 //	init_va_layout();
 	init_physical_allocator();
 	map_region(HHDM, 0, max_hhdm_size, PRESENT | WRITABLE);
-	print("Mapped the entire ram.");
-	
-	// time to go find the pcie
+	print("Mapped the entire ram");
 	
 	// RSDP table (will point to the thing needed to find PCIe)
 	if (!rsdp_req.response) hcf();
 	uint64_t rsdp_va = (uint64_t)rsdp_req.response->address;
 	
 	
-	
 	volatile uint8_t *ptr = (volatile uint8_t *)rsdp_va;
 	
-	// The expected signature
 	const char expected[8] = {'R','S','D',' ','P','T','R',' '};
-	
-	// Compare byte-by-byte
 	bool valid_signature = true;
 	for (int i = 0; i < 8; i++) {
 		if (ptr[i] != expected[i]) {
@@ -538,7 +533,7 @@ extern "C" void kmain(void) {
 	}
 	
 	if (!valid_signature) {
-		print("No valid signature for rsd ptr");
+		print("Error: No valid signature for RSD ptr");
 		hcf();
 	}
 	
@@ -571,7 +566,7 @@ extern "C" void kmain(void) {
 	}
 	
 	if (!valid_signature) {
-		print("No valid signature for rsdt");
+		print("Error: No valid signature for rsdt");
 		hcf();
 	}
 	
@@ -605,16 +600,14 @@ extern "C" void kmain(void) {
 		str[3] = entry[3];
 		str[4] = '\0';
 	
-//		print(str);
 		if (str[0] == 'M' && str[1] == 'C' && str[2] == 'F' && str[3] == 'G') {
-//			print("Found it!");
 			ptr_mcfg = entry;
 			break;
 		}
 	}
 	
 	if (ptr_mcfg == 0) {
-		print("Ptr mcfg == 0");
+		print("Error: ptr_mcfg == 0");
 		hcf();
 	}
 	
@@ -640,13 +633,13 @@ extern "C" void kmain(void) {
 		uint8_t start = e->start_bus;
 		uint8_t end   = e->end_bus;
 		
-		print("nice - let's map this shit");
+		print("Mapping ECAM");
 		
 		uint64_t ecam_size = (uint64_t)(end - start + 1) * 0x100000ULL; // 1MiB per bus
 		uint64_t virt_base = PCI_ECAM_VA_BASE + (uint64_t)seg * PCI_ECAM_SEG_STRIDE;
 		// Map MMIO as UC:
 		map_ecam_region(phys_base, virt_base, ecam_size);
-		print("Mapped!");
+		print("Mapped...");
 		
 		for (uint8_t bus = start; bus < end; bus++) {
 			for (uint8_t dev = 0; dev < 32; dev++) {
@@ -717,11 +710,6 @@ extern "C" void kmain(void) {
 	pci_cfg_write16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04, before | (1 << 1));
 	uint16_t after = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
 	print("After CMD: "); u64_to_hex(after, str); print(str);
-	
-//	// this does... something
-//	uint16_t cmd = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
-//	cmd |= (1 << 1); // enable MMIO
-//	pci_cfg_write16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04, cmd);
 	
 	// Save old value
 	pci_cfg_write32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10, 0xFFFFFFFF);
