@@ -636,14 +636,17 @@ static void map_range_huge(uint64_t va, uint64_t pa, uint64_t len, uint64_t flag
 }
 
 static void map_hhdm_usable(uint64_t flags) {
-	auto mm = memmap_req.response;
-	for (uint64_t i = 0; i < mm->entry_count; i++) {
-		auto *e = mm->entries[i];
-		if (e->type != LIMINE_MEMMAP_USABLE) continue;
-		uint64_t pa0 = align_down(e->base,        0x200000);
-		uint64_t pa1 = align_up  (e->base+e->length, 0x200000);
-		if (pa1 > pa0) map_range_huge(HHDM + pa0, pa0, pa1 - pa0, flags);
-	}
+	
+	map_range_huge(HHDM, 0, max_hhdm_size, flags);
+	
+//	auto mm = memmap_req.response;
+//	for (uint64_t i = 0; i < mm->entry_count; i++) {
+//		auto *e = mm->entries[i];
+//		if (e->type != LIMINE_MEMMAP_USABLE) continue;
+//		uint64_t pa0 = align_down(e->base,        0x200000);
+//		uint64_t pa1 = align_up  (e->base+e->length, 0x200000);
+//		if (pa1 > pa0) map_range_huge(HHDM + pa0, pa0, pa1 - pa0, flags);
+//	}
 }
 
 extern "C" void kmain(void) {
@@ -841,7 +844,7 @@ extern "C" void kmain(void) {
 	print("allocing str");
 	char* str = (char*)alloc_table();
 	print("convert to hex");
-	to_hex(usb_prog_if, str);
+	to_str(usb_prog_if, str);
 	print("Prog_If:");
 	print(str);
 	
