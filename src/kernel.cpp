@@ -610,6 +610,43 @@ static void intel_route_all_ports(uint64_t virt_base,
 	pci_cfg_write32(virt_base, start, bus, dev, fn, 0xDC, usb3prm);
 }
 
+static inline uint64_t align_down(uint64_t x, uint64_t a){ return x & ~(a-1); }
+static inline uint64_t align_up  (uint64_t x, uint64_t a){ return (x + a - 1) & ~(a-1); }
+
+// Write a single 2MiB PD entry (HUGE)
+static void map_2m(uint64_t va, uint64_t pa, uint64_t flags) {
+	volatile uint64_t *pml4 = (volatile uint64_t *)(HHDM + (read_cr3() & PTE_ADDR_MASK));
+	volatile uint64_t *pdpt = descend(pml4, PML4_INDEX(va), 4);
+	volatile uint64_t *pd   = descend(pdpt, PDPT_INDEX(va), 3);
+	pd[PD_INDEX(va)] = (pa & PD_2M_ADDR_MASK) | (flags | PRESENT | WRITABLE | HUGE);
+	asm volatile("invlpg (%0)" :: "r"(va) : "memory");
+}
+
+static void map_range_huge(uint64_t va, uint64_t pa, uint64_t len, uint64_t flags) {
+	// 2MiB chunks
+	while (len >= (1ull<<21) &&
+		   ((va | pa) & ((1ull<<21)-1)) == 0) {
+		map_2m(va, pa, flags);
+		va += (1ull<<21); pa += (1ull<<21); len -= (1ull<<21);
+	}
+	// 4KiB tail
+	while (len) {
+		map_page(va, pa, flags);
+		va += 0x1000; pa += 0x1000; len -= 0x1000;
+	}
+}
+
+static void map_hhdm_usable(uint64_t flags) {
+	auto mm = memmap_req.response;
+	for (uint64_t i = 0; i < mm->entry_count; i++) {
+		auto *e = mm->entries[i];
+		if (e->type != LIMINE_MEMMAP_USABLE) continue;
+		uint64_t pa0 = align_down(e->base,        0x200000);
+		uint64_t pa1 = align_up  (e->base+e->length, 0x200000);
+		if (pa1 > pa0) map_range_huge(HHDM + pa0, pa0, pa1 - pa0, flags);
+	}
+}
+
 extern "C" void kmain(void) {
 	// frame buffer
 	if (!LIMINE_BASE_REVISION_SUPPORTED) hcf();
@@ -635,7 +672,9 @@ extern "C" void kmain(void) {
 	print("Setting up memory management");
 //	init_va_layout();
 	init_physical_allocator();
-	map_region(HHDM, 0, max_hhdm_size, PRESENT | WRITABLE);
+//	map_region(HHDM, 0, max_hhdm_size, PRESENT | WRITABLE);
+	map_hhdm_usable(PRESENT | WRITABLE);
+	
 	print("Mapped the entire ram");
 	
 	// RSDP table (will point to the thing needed to find PCIe)
