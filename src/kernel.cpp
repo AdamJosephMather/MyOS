@@ -288,6 +288,10 @@ void print(char* buffer) {
 char HEX_NUMS[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
 
 void to_hex(uint64_t value, char* buffer) {
+	buffer[0] = 'F';
+	buffer[1] = '\0';
+	return;
+	
 	int n = 18;
 	buffer[n--] = '\0';
 	
