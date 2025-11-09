@@ -834,17 +834,13 @@ extern "C" void kmain(void) {
 		if (usb_found) { break; }
 	}
 	
-	print("GoT out Of the sTupid lOop.");
-	
 	if (!usb_found) {
 		print("Could not find a USB controller!");
 		hcf();
 	}
 	
-	print("allocing str");
-	char* str = (char*)alloc_table();
-	print("convert to hex");
-	to_str(usb_prog_if, str);
+	char str[64];
+	to_hex(usb_prog_if, str);
 	print("Prog_If:");
 	print(str);
 	
@@ -853,7 +849,7 @@ extern "C" void kmain(void) {
 		hcf();
 	}
 	
-	// Read vendor/device id to decide whether to apply Intel routing
+//	Read vendor/device id to decide whether to apply Intel routing
 	uint32_t vid_did = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x00);
 	uint16_t vendor  = (uint16_t)(vid_did & 0xFFFF);
 	
@@ -909,6 +905,8 @@ extern "C" void kmain(void) {
 	print(str);
 	to_hex(bar_addr, str);
 	print(str);
+	
+	bar_addr = 0x15000;
 	
 	map_mmio_region(bar_addr, USB_VA_BASE, mmio_size);
 	
