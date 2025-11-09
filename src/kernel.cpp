@@ -288,10 +288,6 @@ void print(char* buffer) {
 char HEX_NUMS[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
 
 void to_hex(uint64_t value, char* buffer) {
-	buffer[0] = 'F';
-	buffer[1] = '\0';
-	return;
-	
 	int n = 18;
 	buffer[n--] = '\0';
 	
@@ -840,7 +836,7 @@ extern "C" void kmain(void) {
 	}
 	
 	
-	char str[64];
+	char* str = (char*)alloc_table();
 	to_hex(usb_prog_if, str);
 	print("Prog_If:");
 	print(str);
@@ -870,40 +866,25 @@ extern "C" void kmain(void) {
 	// usb uses 1, so does nvme ssd. However, network might use more than one, vga/gpu will use several. Right now let's focus only on usb
 	
 	uint32_t bar0 = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10);
-	uint32_t bar1 = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x14);
-	
-	uint32_t type = (bar0 >> 1) & 0x3;   // 64-bit if == 2
-	bool is64 = (type == 2);
-	
-	// Only relocate if it’s above 4G (or if you just want to force below 4G)
-	uint64_t bar_addr = ((uint64_t)bar1 << 32) | (bar0 & ~0xFULL);
-	
-	
-	
-	// Pick a safe 32-bit hole; 16 KiB aligned.
-	// For QEMU with small RAM, 0xD0000000 is usually free and away from ECAM.
-	const uint64_t new_base = 0xD0000000ULL;
 
-	// Disable Memory Space while moving BAR
-	uint16_t cmd0 = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
-	pci_cfg_write16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04, cmd0 & ~(1u<<1));
-
-	uint32_t flags = bar0 & 0xF; // keep attributes (mem/64-bit/prefetch)
-	pci_cfg_write32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10, (uint32_t)(new_base | flags));
-	if (is64) pci_cfg_write32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x14, 0u);
-
-	// Re-enable MSE|BME
-	pci_cfg_write16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04, (cmd0 | (1u<<1) | (1u<<2)));
-
-	// Read back the assigned address
-	bar0 = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10);
-	bar1 = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x14);
-	bar_addr = ((uint64_t)bar1 << 32) | (bar0 & ~0xFULL);
+	// Check BAR type first!
+	if ((bar0 & 0x1) == 1) {
+		// This is an I/O space BAR - wrong!
+		print("IO space bar err");
+		hcf();
+	}
 	
+	uint32_t bar_type = (bar0 >> 1) & 0x3;
+	uint64_t bar_addr;
 	
-	
-	
-	
+	if (bar_type == 0x2) {
+		// 64-bit BAR - your code is correct
+		uint32_t bar1_high = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x14);
+		bar_addr = ((uint64_t)bar1_high << 32) | (bar0 & ~0xFULL);
+	} else {
+		// 32-bit BAR
+		bar_addr = bar0 & ~0xFULL;
+	}
 	
 	
 	uint16_t before = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
