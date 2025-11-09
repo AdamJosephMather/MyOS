@@ -910,7 +910,7 @@ extern "C" void kmain(void) {
 	to_hex(bar_addr, str);
 	print(str);
 	
-	bar_addr = 0x15000;
+	bar_addr = rsdt_pa_32;
 	
 	map_mmio_region(bar_addr, USB_VA_BASE, mmio_size);
 	
