@@ -38,13 +38,13 @@ run: iso
 	qemu-system-x86_64 \
 		-machine q35 \
 		-m 512M \
+		-bios OVMF.fd \
 		-cdrom myos.iso \
 		-no-reboot \
 		-no-shutdown \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd \
 		-device usb-mouse
-	
 	
 
 
