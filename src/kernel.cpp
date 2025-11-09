@@ -456,7 +456,7 @@ void map_ecam_region(uint64_t phys_base, uint64_t virt_base, uint64_t size) {
 
 void map_mmio_region(uint64_t phys_base, uint64_t virt_base, uint64_t size) {
 	for (uint64_t offset = 0; offset < size; offset += 0x1000) {
-		map_page(virt_base + offset, phys_base + offset, WRITABLE | CACHE_DISABLE | WRITE_THROUGH);
+		map_page(virt_base + offset, phys_base + offset, WRITABLE | CACHE_DISABLE | WRITE_THROUGH | NX);
 	}
 }
 
@@ -468,10 +468,10 @@ void map_region(uint64_t virt_start, uint64_t phys_start, size_t length, uint64_
 	}
 }
 
-uint64_t PCI_ECAM_VA_BASE = 0xFFFF'8000'0000'0000ULL; // pick a canonical kernel VA
-uint64_t PCI_ECAM_SEG_STRIDE         = 0x10000000ULL; // 256 MiB
+uint64_t PCI_ECAM_VA_BASE =      0xFFFF'8000'0000'0000ULL; // pick a canonical kernel VA
+uint64_t PCI_ECAM_SEG_STRIDE              = 0x10000000ULL; // 256 MiB
 
-uint64_t PCI_MMIO_VA_BASE = 0xFFFF'9000'0000'0000ULL;  // canonical
+uint64_t PCI_MMIO_VA_BASE =      0xFFFF'9000'0000'0000ULL;  // canonical
 uint64_t USB_VA_BASE = (PCI_MMIO_VA_BASE + 0x0010'0000ULL); // leave some gap
 
 
@@ -909,8 +909,6 @@ extern "C" void kmain(void) {
 	print(str);
 	to_hex(bar_addr, str);
 	print(str);
-	
-	bar_addr = rsdt_pa_32;
 	
 	map_mmio_region(bar_addr, USB_VA_BASE, mmio_size);
 	
