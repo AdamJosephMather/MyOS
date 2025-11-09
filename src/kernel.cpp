@@ -273,7 +273,7 @@ int current_print_line = 0;
 
 void print(char* buffer) {
 	uint64_t i = 0;
-	for (int j = 0; j < 30; j++) {
+	while (true) {
 		char c = buffer[i];
 		if (c == '\0') {
 			break;
@@ -819,24 +819,28 @@ extern "C" void kmain(void) {
 						usb_prog_if = prog_if;
 						usb_found = true;
 						print("Found a USB controller!");
-						
 						break;
 						// You can optionally differentiate:
 						// if (prog_if == 0x30) -> XHCI
 					}
 				}
+				if (usb_found) { break; }
 			}
 			if (usb_found) { break; }
 		}
+		if (usb_found) { break; }
 	}
+	
+	print("GoT out Of the sTupid lOop.");
 	
 	if (!usb_found) {
 		print("Could not find a USB controller!");
 		hcf();
 	}
 	
-	
+	print("allocing str");
 	char* str = (char*)alloc_table();
+	print("convert to hex");
 	to_hex(usb_prog_if, str);
 	print("Prog_If:");
 	print(str);
