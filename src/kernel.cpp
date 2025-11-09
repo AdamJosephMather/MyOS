@@ -959,21 +959,11 @@ extern "C" void kmain(void) {
 	volatile uint64_t* erstba = (volatile uint64_t*)(rt_base + 0x20 + 0x10);
 	volatile uint64_t* erdp   = (volatile uint64_t*)(rt_base + 0x20 + 0x18);
 	
-	print("about to reset");
-	
 	// --- Reset sequence ---
 	while (!(ops->usbsts & 1)) { /* ensure halted */ }
-	
-	print("first");
-	
 	ops->usbcmd |= (1u << 1);     // HCRST
 	while (ops->usbcmd & (1u << 1)) { /* wait reset complete */ }
-	
-	print("second");
-	
 	while (ops->usbsts & (1u << 11)) { /* CNR clears */ }
-	
-	print("Controller reset complete!");
 	
 	// --- Build Command Ring ---
 	struct Ring cr = {};
