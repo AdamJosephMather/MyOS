@@ -291,17 +291,13 @@ void to_hex(uint64_t value, char* buffer) {
 	int n = 18;
 	buffer[n--] = '\0';
 	
-	print("some");
-	
 	for (int i = 0; i < 16; ++i) {
 		uint8_t digit = value & 0xF;
 		buffer[n--] = HEX_NUMS[digit];
 		value >>= 4;
 	}
-	print("test");
 	buffer[n--] = 'x';
 	buffer[n--] = '0';
-	print("fucked");
 }
 
 
@@ -834,8 +830,6 @@ extern "C" void kmain(void) {
 		}
 	}
 	
-	print("Got to here");
-	
 	if (!usb_found) {
 		print("Could not find a USB controller!");
 		hcf();
@@ -871,10 +865,31 @@ extern "C" void kmain(void) {
 	// essentially a bar is a register holding the loaction that will store the space in which we will communicate with the device.
 	// usb uses 1, so does nvme ssd. However, network might use more than one, vga/gpu will use several. Right now let's focus only on usb
 	
-	uint32_t bar0_low  = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10);
-	uint32_t bar1_high = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x14);
+	uint32_t bar0 = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10);
+
+	// Check BAR type first!
+	if ((bar0 & 0x1) == 1) {
+		// This is an I/O space BAR - wrong!
+		print("IO space bar err");
+		hcf();
+	}
 	
-	uint64_t bar_addr = ((uint64_t)bar1_high << 32) | (bar0_low & ~0xFULL);
+	uint32_t bar_type = (bar0 >> 1) & 0x3;
+	uint64_t bar_addr;
+	
+	if (bar_type == 0x2) {
+		// 64-bit BAR - your code is correct
+		uint32_t bar1_high = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x14);
+		bar_addr = ((uint64_t)bar1_high << 32) | (bar0 & ~0xFULL);
+	} else {
+		// 32-bit BAR
+		bar_addr = bar0 & ~0xFULL;
+	}
+	
+	uint32_t bar0_low  = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10);
+//	uint32_t bar1_high = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x14);
+//	
+//	uint64_t bar_addr = ((uint64_t)bar1_high << 32) | (bar0_low & ~0xFULL);
 	
 	
 	
@@ -890,13 +905,23 @@ extern "C" void kmain(void) {
 	
 	uint64_t mmio_size = ~(size_mask & ~0xF) + 1;
 	
+	to_str(mmio_size, str);
+	print(str);
+	to_hex(bar_addr, str);
+	print(str);
+	
 	map_mmio_region(bar_addr, USB_VA_BASE, mmio_size);
 	
 	print("Mapped USB");
 	
 	volatile uint32_t* read = (volatile uint32_t*)USB_VA_BASE;
 	
+	print("TEST _COMMENT");
+	
 	uint32_t info = read[0];
+	
+	print("Test_3");
+	
 	to_hex(info, str); print(str);
 	to_hex((info>>16)&0xFFFF, str); print(str);
 	
