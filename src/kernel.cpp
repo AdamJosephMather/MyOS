@@ -273,7 +273,7 @@ int current_print_line = 0;
 
 void print(char* buffer) {
 	uint64_t i = 0;
-	while (true) {
+	for (int j = 0; j < 30; j++) {
 		char c = buffer[i];
 		if (c == '\0') {
 			break;
@@ -288,26 +288,16 @@ void print(char* buffer) {
 char HEX_NUMS[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
 
 void to_hex(uint64_t value, char* buffer) {
-	print("1");
 	int n = 18;
-	print("2");
 	buffer[n--] = '\0';
-	print("3");
 	
 	for (int i = 0; i < 16; ++i) {
-		print("4");
 		uint8_t digit = value & 0xF;
-		print("5");
 		buffer[n--] = HEX_NUMS[digit];
-		print("6");
 		value >>= 4;
-		print("7");
 	}
-	print("8");
 	buffer[n--] = 'x';
-	print("9");
 	buffer[n--] = '0';
-	print("10");
 }
 
 
