@@ -636,17 +636,15 @@ static void map_range_huge(uint64_t va, uint64_t pa, uint64_t len, uint64_t flag
 }
 
 static void map_hhdm_usable(uint64_t flags) {
-	
-	map_range_huge(HHDM, 0, max_hhdm_size, flags);
-	
-//	auto mm = memmap_req.response;
-//	for (uint64_t i = 0; i < mm->entry_count; i++) {
-//		auto *e = mm->entries[i];
-//		if (e->type != LIMINE_MEMMAP_USABLE) continue;
-//		uint64_t pa0 = align_down(e->base,        0x200000);
-//		uint64_t pa1 = align_up  (e->base+e->length, 0x200000);
-//		if (pa1 > pa0) map_range_huge(HHDM + pa0, pa0, pa1 - pa0, flags);
-//	}
+//	map_range_huge(HHDM, 0, max_hhdm_size, flags);
+	auto mm = memmap_req.response;
+	for (uint64_t i = 0; i < mm->entry_count; i++) {
+		auto *e = mm->entries[i];
+		if (e->type != LIMINE_MEMMAP_USABLE) continue;
+		uint64_t pa0 = align_down(e->base,        0x200000);
+		uint64_t pa1 = align_up  (e->base+e->length, 0x200000);
+		if (pa1 > pa0) map_range_huge(HHDM + pa0, pa0, pa1 - pa0, flags);
+	}
 }
 
 extern "C" void kmain(void) {
@@ -672,9 +670,7 @@ extern "C" void kmain(void) {
 	
 	// Let's go map the memmory
 	print("Setting up memory management");
-//	init_va_layout();
 	init_physical_allocator();
-//	map_region(HHDM, 0, max_hhdm_size, PRESENT | WRITABLE);
 	map_hhdm_usable(PRESENT | WRITABLE);
 	
 	print("Mapped the entire ram");
@@ -834,16 +830,12 @@ extern "C" void kmain(void) {
 		if (usb_found) { break; }
 	}
 	
-	print("GoT out Of the sTupid lOop.");
-	
 	if (!usb_found) {
 		print("Could not find a USB controller!");
 		hcf();
 	}
 	
-	print("allocing str");
 	char* str = (char*)alloc_table();
-	print("convert to hex");
 	to_str(usb_prog_if, str);
 	print("Prog_If:");
 	print(str);
@@ -916,11 +908,7 @@ extern "C" void kmain(void) {
 	
 	volatile uint32_t* read = (volatile uint32_t*)USB_VA_BASE;
 	
-	print("TEST _COMMENT");
-	
 	uint32_t info = read[0];
-	
-	print("Test_3");
 	
 	to_hex(info, str); print(str);
 	to_hex((info>>16)&0xFFFF, str); print(str);
