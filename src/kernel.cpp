@@ -444,7 +444,7 @@ void map_page(uint64_t va, uint64_t pa, uint64_t flags) {
 	volatile uint64_t *pdpt = descend(pml4, PML4_INDEX(va), 4);  // top level is not huge
 	volatile uint64_t *pd   = descend(pdpt, PDPT_INDEX(va), 3);  // split 1 GiB if needed
 	volatile uint64_t *pt   = descend(pd,   PD_INDEX(va),   2);  // split 2 MiB if needed
-
+	
 	pt[PT_INDEX(va)] = (pa & PTE_ADDR_MASK) | (flags | PRESENT);
 	asm volatile("invlpg (%0)" :: "r"(va) : "memory");
 }
@@ -643,7 +643,7 @@ extern "C" void kmain(void) {
 	uint64_t rsdp_va = (uint64_t)rsdp_req.response->address;
 	
 	
-	volatile uint8_t *ptr = (volatile uint8_t *)rsdp_va;
+	volatile uint8_t *ptr = (volatile uint8_t*)rsdp_va;
 	
 	const char expected[8] = {'R','S','D',' ','P','T','R',' '};
 	bool valid_signature = true;
@@ -675,10 +675,7 @@ extern "C" void kmain(void) {
 	uint64_t rsdt_va = HHDM+(uint64_t)rsdt_pa_32;
 	volatile uint8_t *ptr_rsdt = (volatile uint8_t *)rsdt_va;
 	
-	// The expected signature
 	const char expected_rsdt[4] = {'R','S','D','T'};
-	
-	// Compare byte-by-byte
 	valid_signature = true;
 	for (int i = 0; i < 4; i++) {
 		if (ptr_rsdt[i] != expected_rsdt[i]) {
@@ -686,7 +683,6 @@ extern "C" void kmain(void) {
 			break;
 		}
 	}
-	
 	if (!valid_signature) {
 		print("Error: No valid signature for rsdt");
 		hcf();
@@ -827,7 +823,6 @@ extern "C" void kmain(void) {
 		intel_route_all_ports(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn);
 	}
 	
-	
 	// now that we have the usb device here, we need to identify the location of the bar addresses.
 	// essentially a bar is a register holding the loaction that will store the space in which we will communicate with the device.
 	// usb uses 1, so does nvme ssd. However, network might use more than one, vga/gpu will use several. Right now let's focus only on usb
@@ -881,7 +876,7 @@ extern "C" void kmain(void) {
 	print("Cap len: ");
 	to_str(caplen, str);
 	print(str);
-		
+	
 	volatile XHCIOpRegs* ops = (volatile XHCIOpRegs*)((uintptr_t)USB_VA_BASE + caplen);
 	
 	// Doorbell and Runtime bases per spec (32-bit DB registers!)
@@ -1217,6 +1212,8 @@ extern "C" void kmain(void) {
 		              (uint32_t)(input_ctx_phys & 0xFFFFFFFF),
 		              (uint32_t)(input_ctx_phys >> 32));
 		doorbell32[0] = 0;
+		
+		
 	}
 	
 	print("Port scan complete.");
