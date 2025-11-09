@@ -257,20 +257,6 @@ void to_str(uint64_t value, char* buffer) {
 	}
 }
 
-char HEX_NUMS[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
-
-void to_hex(uint64_t value, char* buffer) {
-	int n = 18; 
-	buffer[n--] = '\0';
-	
-	for (int i = 0; i < 16; ++i) {
-		uint8_t digit = value & 0xF;
-		buffer[n--] = HEX_NUMS[digit];
-		value >>= 4;
-	}
-	buffer[n--] = 'x';
-	buffer[n--] = '0';
-}
 
 void draw_char(int x, int y, char c, uint32_t color) {
 	const uint8_t* glyph = font8x8_basic[(int)c];
@@ -299,7 +285,24 @@ void print(char* buffer) {
 	current_print_line ++;
 }
 
+char HEX_NUMS[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
 
+void to_hex(uint64_t value, char* buffer) {
+	int n = 18;
+	buffer[n--] = '\0';
+	
+	print("some");
+	
+	for (int i = 0; i < 16; ++i) {
+		uint8_t digit = value & 0xF;
+		buffer[n--] = HEX_NUMS[digit];
+		value >>= 4;
+	}
+	print("test");
+	buffer[n--] = 'x';
+	buffer[n--] = '0';
+	print("fucked");
+}
 
 
 
@@ -830,6 +833,8 @@ extern "C" void kmain(void) {
 			if (usb_found) { break; }
 		}
 	}
+	
+	print("Got to here");
 	
 	if (!usb_found) {
 		print("Could not find a USB controller!");
