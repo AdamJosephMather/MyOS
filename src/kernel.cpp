@@ -329,7 +329,7 @@ void init_physical_allocator() {
 
 	for (uint64_t i = 0; i < memmap->entry_count; i++) {
 		auto *entry = memmap->entries[i];
-		if (entry->type == LIMINE_MEMMAP_USABLE && entry->length > best_len && entry->base > GUARD) {
+		if (entry->type == LIMINE_MEMMAP_USABLE && entry->length > best_len) {
 			best_len = entry->length;
 			best_base = (entry->base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 		}
@@ -959,10 +959,18 @@ extern "C" void kmain(void) {
 	volatile uint64_t* erstba = (volatile uint64_t*)(rt_base + 0x20 + 0x10);
 	volatile uint64_t* erdp   = (volatile uint64_t*)(rt_base + 0x20 + 0x18);
 	
+	print("about to reset");
+	
 	// --- Reset sequence ---
 	while (!(ops->usbsts & 1)) { /* ensure halted */ }
+	
+	print("first");
+	
 	ops->usbcmd |= (1u << 1);     // HCRST
 	while (ops->usbcmd & (1u << 1)) { /* wait reset complete */ }
+	
+	print("second");
+	
 	while (ops->usbsts & (1u << 11)) { /* CNR clears */ }
 	
 	print("Controller reset complete!");
