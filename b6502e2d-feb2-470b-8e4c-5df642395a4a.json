@@ -1,4 +1,4 @@
 {
 	"LSPs": {},
-	"build_command": "\n\nmake clean && make iso && make run"
+	"build_command": "\n\ncd /mnt/d/Users/adamj/Documents/C/MyOS && make clean && make iso && make run"
 }

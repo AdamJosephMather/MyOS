@@ -235,7 +235,7 @@ void pci_cfg_write16(uint64_t virt_base, uint8_t start_bus, uint8_t bus, uint8_t
 	*val = towrite;
 }
 
-void u64_to_str(uint64_t value, char* buffer) {
+void to_str(uint64_t value, char* buffer) {
 	if (value == 0) {
 		buffer[0] = '0';
 		buffer[1] = '\0';
@@ -259,7 +259,7 @@ void u64_to_str(uint64_t value, char* buffer) {
 
 char HEX_NUMS[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
 
-void u64_to_hex(uint64_t value, char* buffer) {
+void to_hex(uint64_t value, char* buffer) {
 	int n = 18; 
 	buffer[n--] = '\0';
 	
@@ -345,11 +345,11 @@ void init_physical_allocator() {
 //	if (debug) {
 	char str[64];
 	
-	u64_to_hex(next_free_phys_page, str);
+	to_hex(next_free_phys_page, str);
 	print("Next free phys page");
 	print(str);
 	
-	u64_to_hex(max_free_phys_page, str);
+	to_hex(max_free_phys_page, str);
 	print("Max free phys page");
 	print(str);
 //	}
@@ -469,24 +469,146 @@ void map_region(uint64_t virt_start, uint64_t phys_start, size_t length, uint64_
 	}
 }
 
-struct __attribute__((packed)) XHCICapRegs {
-	uint8_t caplength;
-	uint8_t reserved;
-	uint16_t hciversion;
-	uint32_t hcsparams1;
-	uint32_t hcsparams2;
-	uint32_t hcsparams3;
-	uint32_t hccparams1;
-	uint32_t dboff;
-	uint32_t rtsoff;
-};
-
 uint64_t PCI_ECAM_VA_BASE = 0xFFFF'8000'0000'0000ULL; // pick a canonical kernel VA
 uint64_t PCI_ECAM_SEG_STRIDE         = 0x10000000ULL; // 256 MiB
 
 uint64_t PCI_MMIO_VA_BASE = 0xFFFF'9000'0000'0000ULL;  // canonical
 uint64_t USB_VA_BASE = (PCI_MMIO_VA_BASE + 0x0010'0000ULL); // leave some gap
 
+
+struct XHCIOpRegs {
+	volatile uint32_t usbcmd;       // 00h
+	volatile uint32_t usbsts;       // 04h
+	volatile uint32_t pagesize;     // 08h (RO capabilities)
+	volatile uint8_t  reserved1[8]; // 0Ch
+	volatile uint32_t dnctrl;       // 14h
+	volatile uint64_t crcr;         // 18h
+	volatile uint8_t  reserved2[16];
+	volatile uint64_t dcbaap;       // 30h
+	volatile uint32_t config;       // 38h
+};
+
+struct TRB {
+	uint64_t parameter;
+	uint32_t status;
+	uint32_t control;
+} __attribute__((packed, aligned(16)));
+
+struct ERSTEntry {
+	uint64_t ring_segment_base;
+	uint32_t ring_segment_size;
+	uint32_t reserved;
+} __attribute__((packed, aligned(16)));
+
+struct Ring {
+	volatile TRB *trb;   // 256 entries: 0..254 data, 255 = Link TRB
+	uint64_t phys;
+	uint32_t enq;        // 0..254
+	uint8_t  pcs;        // Producer Cycle State (1 initially)
+};
+
+struct InputControlCtx {
+	uint32_t drop_flags;    // which contexts to drop
+	uint32_t add_flags;     // which contexts to add
+	uint32_t rsvd[6];
+};
+
+struct SlotCtx {
+	uint32_t route_string;
+	uint32_t speed;      // set per-port speed
+	uint32_t rsvd2;
+	uint32_t rsvd3;
+	uint32_t tt_hub_slotid;
+	uint32_t tt_portnum;
+	uint32_t port_num;   // which root port this device is on
+	uint32_t rsvd4;
+};
+
+struct EndpointCtx {
+	uint32_t ep_state;       // Dword 0
+	uint32_t ep_flags;       // Dword 1
+	uint64_t tr_deq_ptr;     // Dword 2-3
+	uint32_t avg_trb_len;    // Dword 4
+	uint32_t max_esit_hi;    // Dword 5
+	uint32_t reserved[2];    // Dword 6-7
+} __attribute__((packed));
+
+void ring_init(struct Ring *r) {
+	r->trb = (volatile TRB*)alloc_table();     // 4 KiB
+	r->phys = (uint64_t)r->trb - HHDM;
+	r->enq = 0;
+	r->pcs = 1;
+
+	// All TRBs must start with cycle=0
+	for (int i = 0; i < 256; i++) r->trb[i].control = 0;
+
+	// Link TRB at 255 -> back to start, Toggle Cycle
+	r->trb[255].parameter = r->phys;
+	r->trb[255].status = 0;
+	r->trb[255].control = (6u<<10) | (1u<<1);  // Type=Link, TC=1, C=0
+}
+
+void ring_push_cmd(struct Ring *r, uint32_t ctrl, uint64_t param, uint32_t status) {
+	volatile TRB *t = &r->trb[r->enq];
+	t->parameter = param;
+	t->status    = status;
+	t->control   = (ctrl & ~1u) | r->pcs;  // set Cycle=PCS
+
+	if (++r->enq == 255) {                 // wrap across Link TRB
+		r->enq = 0;
+		r->pcs ^= 1;
+	}
+}
+
+// NEW: tiny spin delay; tuned big enough for "ms-ish" waits on boot
+static inline void spin_delay(volatile uint64_t iters) {
+	for (volatile uint64_t i=0; i<iters; ++i) { __asm__ __volatile__("pause"); }
+}
+
+// NEW: walk xECP and claim OS ownership; also kill legacy SMIs
+static void xhci_legacy_handoff(uint32_t hcc1, uint64_t mmio_base) {
+	uint32_t xecp_dw = (hcc1 >> 16) & 0xFFFF;   // dword offset from MMIO base
+	while (xecp_dw) {
+		volatile uint32_t *ec = (volatile uint32_t*)(mmio_base + (uint64_t)xecp_dw*4);
+		uint32_t hdr   = ec[0];
+		uint32_t capid =  hdr        & 0xFF;
+		uint32_t next  = (hdr >> 8)  & 0xFF;
+
+		if (capid == 1) { // USB Legacy Support
+			volatile uint32_t *usblegsup    = ec + 0;   // xECP + 0x00
+			volatile uint32_t *usblegctlsts = ec + 1;   // xECP + 0x04
+
+			// Set OS Owned (bit 24)
+			*usblegsup |= (1u << 24);
+			// Wait BIOS Owned (bit 16) to clear
+			for (int t=0; t<1000000 && (*usblegsup & (1u<<16)); ++t) { __asm__ __volatile__("pause"); }
+
+			// Disable legacy SMIs and clear any pending RW1C
+			*usblegctlsts = 0;           // clear enables (RW)
+			*usblegctlsts = 0xFFFFFFFF;  // clear status (RW1C)
+			break;
+		}
+		xecp_dw = next; // next is dword offset (0 means end)
+	}
+}
+
+// NEW: Intel-only routing quirk (Panther Point & friends)
+static void intel_route_all_ports(uint64_t virt_base,
+								  uint8_t start, uint8_t bus, uint8_t dev, uint8_t fn)
+{
+	// Mirror masks the BIOS allowed into the live route registers.
+	// XUSB2PRM -> XUSB2PR
+	uint32_t xusb2prm = pci_cfg_read32(virt_base, start, bus, dev, fn, 0xD4);
+	pci_cfg_write32(virt_base, start, bus, dev, fn, 0xD0, xusb2prm);
+
+	// Enable SuperSpeed termination
+	uint32_t usb3_pssen = pci_cfg_read32(virt_base, start, bus, dev, fn, 0xD8);
+	pci_cfg_write32(virt_base, start, bus, dev, fn, 0xD8, usb3_pssen);
+
+	// USB3 routing: USB3PRM -> USB3PR (older docs call it XUSB3PRM)
+	uint32_t usb3prm = pci_cfg_read32(virt_base, start, bus, dev, fn, 0xDC);
+	pci_cfg_write32(virt_base, start, bus, dev, fn, 0xDC, usb3prm);
+}
 
 extern "C" void kmain(void) {
 	// frame buffer
@@ -641,7 +763,7 @@ extern "C" void kmain(void) {
 		map_ecam_region(phys_base, virt_base, ecam_size);
 		print("Mapped...");
 		
-		for (uint8_t bus = start; bus < end; bus++) {
+		for (uint8_t bus = start; bus <= end; bus++) {
 			for (uint8_t dev = 0; dev < 32; dev++) {
 				for (uint8_t fn = 0; fn < 8; fn++) {
 					uint32_t id = pci_cfg_read32(virt_base, start, bus, dev, fn, 0x00);
@@ -670,6 +792,7 @@ extern "C" void kmain(void) {
 					}
 				}
 			}
+			if (usb_found) { break; }
 		}
 	}
 	
@@ -680,7 +803,7 @@ extern "C" void kmain(void) {
 	
 	
 	char str[64];
-	u64_to_hex(usb_prog_if, str);
+	to_hex(usb_prog_if, str);
 	print("Prog_If:");
 	print(str);
 	
@@ -688,6 +811,22 @@ extern "C" void kmain(void) {
 		print("Unsupported USB protocol.");
 		hcf();
 	}
+	
+	// Read vendor/device id to decide whether to apply Intel routing
+	uint32_t vid_did = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x00);
+	uint16_t vendor  = (uint16_t)(vid_did & 0xFFFF);
+	
+	// Enable Memory Space + **Bus Mastering** (needed for DMA)
+	uint16_t pcmd = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
+	pcmd |= (1u<<1) | (1u<<2); // MSE | BME
+	pci_cfg_write16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04, pcmd);
+	
+	// Intel quirk: route ports the BIOS allows to xHCI
+	if (vendor == 0x8086) {
+		print((char*)"Applying Intel xHCI routing...");
+		intel_route_all_ports(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn);
+	}
+	
 	
 	// now that we have the usb device here, we need to identify the location of the bar addresses.
 	// essentially a bar is a register holding the loaction that will store the space in which we will communicate with the device.
@@ -698,54 +837,389 @@ extern "C" void kmain(void) {
 	
 	uint64_t bar_addr = ((uint64_t)bar1_high << 32) | (bar0_low & ~0xFULL);
 	
-	print("Got the bar addr...");
-	u64_to_hex(bar_addr, str);
-	print(str);
 	
 	
 	
 	uint16_t before = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
-	print("Before CMD: "); u64_to_hex(before, str); print(str);
-	
 	pci_cfg_write16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04, before | (1 << 1));
 	uint16_t after = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
-	print("After CMD: "); u64_to_hex(after, str); print(str);
 	
 	// Save old value
 	pci_cfg_write32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10, 0xFFFFFFFF);
 	uint32_t size_mask = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10);
 	pci_cfg_write32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10, bar0_low); // restore
 	
-	print("Got the size mask...");
-	u64_to_hex(size_mask, str);
-	print(str);
-	
 	uint64_t mmio_size = ~(size_mask & ~0xF) + 1;
 	
-	print("Got the mmio size...");
-	u64_to_hex(mmio_size, str);
-	print(str);
-	
-//	debug = true;
 	map_mmio_region(bar_addr, USB_VA_BASE, mmio_size);
 	
 	print("Mapped USB");
 	
-	uint32_t info = *(volatile uint32_t*)USB_VA_BASE;
-	u64_to_hex(info, str); print(str);
+	volatile uint32_t* read = (volatile uint32_t*)USB_VA_BASE;
 	
-	u64_to_hex((info>>16)&0xFFFF, str); print(str);
+	uint32_t info = read[0];
+	to_hex(info, str); print(str);
+	to_hex((info>>16)&0xFFFF, str); print(str);
 	
-	uint32_t cap_len = (info & 0xFF);
+	uint32_t caplen = (info & 0xFF);
 	uint32_t ver = (info>>16) & 0xFFFF;
+	uint32_t hcs1 = read[1] & 0xFFFFFFFF;
+	uint32_t hcs2 = read[2] & 0xFFFFFFFF;
+	uint32_t hcs3 = read[3] & 0xFFFFFFFF;
+	uint32_t hcc1 = read[4] & 0xFFFFFFFF;
+	uint32_t dboff = read[5] & 0xFFFFFFFF;
+	uint32_t rtsoff = read[6] & 0xFFFFFFFF;
+	uint32_t hccparams2 = read[7] & 0xFFFFFFFF;
 	
-	print("Cap len: ");
-	u64_to_str(cap_len, str);
-	print(str);
+	
+	xhci_legacy_handoff(hcc1, USB_VA_BASE);
+	
 	
 	print("XHCI found, version: ");
-	u64_to_str(ver, str);
+	to_str(ver, str);
 	print(str);
+	print("Cap len: ");
+	to_str(caplen, str);
+	print(str);
+		
+	volatile XHCIOpRegs* ops = (volatile XHCIOpRegs*)((uintptr_t)USB_VA_BASE + caplen);
+	
+	// Doorbell and Runtime bases per spec (32-bit DB registers!)
+	volatile uint32_t* doorbell32 = (volatile uint32_t*)(USB_VA_BASE + (dboff & ~0x3));
+	volatile uint8_t*  rt_base    = (volatile uint8_t*)(USB_VA_BASE + (rtsoff & ~0x1F));
+	
+	// Interrupter 0 regs at rt_base + 0x20
+	volatile uint32_t* iman   = (volatile uint32_t*)(rt_base + 0x20 + 0x00);
+	volatile uint32_t* imod   = (volatile uint32_t*)(rt_base + 0x20 + 0x04);
+	volatile uint32_t* erstsz = (volatile uint32_t*)(rt_base + 0x20 + 0x08);
+	volatile uint64_t* erstba = (volatile uint64_t*)(rt_base + 0x20 + 0x10);
+	volatile uint64_t* erdp   = (volatile uint64_t*)(rt_base + 0x20 + 0x18);
+	
+	// --- Reset sequence ---
+	while (!(ops->usbsts & 1)) { /* ensure halted */ }
+	ops->usbcmd |= (1u << 1);     // HCRST
+	while (ops->usbcmd & (1u << 1)) { /* wait reset complete */ }
+	while (ops->usbsts & (1u << 11)) { /* CNR clears */ }
+	
+	print("Controller reset complete!");
+	
+	// --- Build Command Ring ---
+	struct Ring cr = {};
+	ring_init(&cr);
+	ops->crcr = (cr.phys & ~0x3FULL) | 1;      // RCS=1
+	
+	// --- Build Event Ring + ERST (single segment) ---
+	volatile TRB* er_virt = (volatile TRB*)alloc_table();
+	uint64_t er_phys = ((uint64_t)er_virt) - HHDM;
+	// Event ring entries start with Cycle=0; controller will write with CCS=1
+	for (int i = 0; i < 256; i++) {
+		er_virt[i].parameter = 0;
+		er_virt[i].status    = 0;
+		er_virt[i].control   = 0; // Cycle=0
+	}
+	
+	volatile ERSTEntry* erst = (volatile ERSTEntry*)alloc_table();
+	uint64_t erst_phys = ((uint64_t)erst) - HHDM;
+	
+	erst[0].ring_segment_base = er_phys;
+	erst[0].ring_segment_size = 256;
+	erst[0].reserved          = 0;
+	
+	// Program Interrupter 0 ERST/ERDP
+	*erstsz = 1;
+	*erstba = erst_phys;
+	*erdp   = er_phys; // dequeue pointer at start
+	
+	// Enable interrupter (optional for polling, but correct bit)
+	*iman |= (1u << 1); // IE=1
+	
+	// --- DCBAA & CONFIG, including Scratchpad if required ---
+	uint32_t max_slots = hcs1 & 0xFF;
+	
+	volatile uint64_t* dcbaa_virt = (volatile uint64_t*)alloc_table(); // 4K page
+	uint64_t dcbaa_phys = ((uint64_t)dcbaa_virt) - HHDM;
+	for (uint32_t i = 0; i < max_slots; i++) { dcbaa_virt[i] = 0; }
+	
+	// Scratchpad requirement from HCSPARAMS2:
+	// total_scratch = (MaxScratchpadHi << 5) | MaxScratchpadLo
+//	uint32_t hcs2 = /* your code should have read this earlier */ (uint32_t)hcs2;
+	uint32_t sp_lo = (hcs2 & 0x1F);             // bits 4:0
+	uint32_t sp_hi = (hcs2 >> 27) & 0x1F;       // bits 31:27
+	uint32_t sp_count = (sp_hi << 5) | sp_lo;
+	
+	if (sp_count) {
+		// Allocate Scratchpad Buffer Array (list of physical addrs to pages)
+		volatile uint64_t* sp_array_virt = (volatile uint64_t*)alloc_table();
+		uint64_t sp_array_phys = ((uint64_t)sp_array_virt) - HHDM;
+	
+		for (uint32_t i = 0; i < sp_count; i++) {
+			// one 4KiB scratch page each (could be larger page sizes if supported)
+			volatile uint8_t* page = (volatile uint8_t*)alloc_table();
+			uint64_t page_phys = ((uint64_t)page) - HHDM;
+			sp_array_virt[i] = page_phys;
+		}
+		// DCBAA[0] must point to Scratchpad Buffer Array when present
+		dcbaa_virt[0] = sp_array_phys;
+	}
+	
+	ops->dcbaap = dcbaa_phys;
+	ops->config = max_slots;
+	
+	// --- Run the controller ---
+	ops->usbcmd |= 1u;                 // Run/Stop = 1
+	while (ops->usbsts & 1u) { /* wait HCHalted==0 */ }
+	
+	// Re-write CRCR after run (harmless; keeps you consistent with some drivers)
+	ops->crcr = (cr.phys & ~0x3FULL) | 1;
+	
+	print("Controller running!");
+	
+	// --- Port loop & Enable Slot command ---
+	// --- Port loop & Enable Slot command (FIXED) ---
+	uint8_t max_ports = (hcs1 >> 24) & 0xFF;
+	uint8_t ccs = 1; // Consumer Cycle State for event ring
+	uint8_t erdp_index = 0;
+	
+	// Check if Port Power Control is needed
+	bool needs_ppc = (hcc1 & (1u << 3));
+	
+	if (needs_ppc) {
+		print("We will be powering ports manually.");
+	}
+	
+	
+	print("Waiting for device connections...");
+	size_t timeout = 5000000;  // Wait up to ~5 seconds
+	while (timeout-- > 0) {
+		TRB* evt = (TRB*)&er_virt[erdp_index];
+		uint32_t ctrl = evt->control;
+		uint32_t cyc = ctrl & 1u;
+		
+		if (cyc == ccs) {
+			uint32_t type = (ctrl >> 10) & 0x3F;
+			
+			if (type == 34) {
+				// Handle PSC event
+				uint32_t port_id = (evt->parameter >> 24) & 0xFF;
+				print("Port Status Change on port ");
+				to_str(port_id, str); print(str);
+				
+				volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)ops + 0x400 + (port_id-1) * 0x10);
+				uint32_t psc = *portsc;
+				
+				// Check if device connected
+				if (psc & 1u) {  // CCS bit
+					print("Device NOW connected!");
+					// Clear CSC bit
+					*portsc |= (1u << 17);
+					// Re-run your port enumeration logic here
+				}
+			} else {
+				print("Event type: ");
+				to_str(type, str);
+				print(str);
+			}
+			
+			// **CRITICAL: Advance ERDP after consuming ANY event**
+			erdp_index = (erdp_index + 1) % 256;
+			if (erdp_index == 0) ccs ^= 1;  // Toggle cycle state when wrapping
+			
+			uint64_t new_erdp = er_phys + (erdp_index * 16);
+			*erdp = new_erdp | (1ull << 3);  // Write new ERDP with EHB bit
+		}
+		
+		for (volatile int i = 0; i < 1000; i++);
+	}
+	
+	print("Scanning ports...");
+	
+	// PORTSC helpers
+	constexpr uint32_t PORTSC_CCS = 1u << 0;
+	constexpr uint32_t PORTSC_PED = 1u << 1;
+	constexpr uint32_t PORTSC_PR  = 1u << 4;
+	constexpr uint32_t PORTSC_PLS_MASK = 0xFu << 5;   // bits 5..8
+	constexpr uint32_t PORTSC_PP  = 1u << 9;
+	constexpr uint32_t PORTSC_PS_MASK  = 0xFu << 10;  // bits 10..13
+	constexpr uint32_t PORTSC_PIC_MASK = 0x3u << 14;  // bits 14..15
+	constexpr uint32_t PORTSC_LWS = 1u << 16;
+	constexpr uint32_t PORTSC_W1C = (1u<<17)|(1u<<18)|(1u<<19)|(1u<<20)|
+									(1u<<21)|(1u<<22)|(1u<<23); // CSC..CEC
+	
+	// Clear any *set* change bits (W1C), preserving everything else:
+	auto ack_port_changes = [&](volatile uint32_t* portsc) {
+		uint32_t v = *portsc;
+		uint32_t w = (v & ~PORTSC_W1C) | (v & PORTSC_W1C); // write 1s only where bits are set
+		*portsc = w;
+	};
+	
+	// Issue port reset *without* dropping PP/PLS/PS/PIC:
+	auto port_reset = [&](volatile uint32_t* portsc) -> bool {
+		uint32_t v = *portsc;
+	
+		// If you have PPC, make sure PP is on before anything else.
+		v |= PORTSC_PP;
+	
+		// Do not accidentally clear W1C bits when setting PR.
+		uint32_t w = (v & ~PORTSC_W1C) | PORTSC_PR;
+		*portsc = w;
+	
+		// Wait for PR to clear (reset complete)
+		int timeout = 100000;
+		while ((*portsc & PORTSC_PR) && --timeout) { __asm__ __volatile__("pause"); }
+		if (!timeout) return false;
+	
+		// After PR clears, the xHC should set PED=1 and PRC=1. Ack PRC.
+		uint32_t v2 = *portsc;
+		uint32_t w2 = (v2 & ~PORTSC_W1C) | (1u<<21); // PRC W1C
+		*portsc = w2;
+		return true;
+	};
+	
+	
+	for (uint32_t i = 0; i < max_ports; i++) {
+		volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)ops + 0x400 + i * 0x10);
+		
+		if (needs_ppc) {
+			*portsc |= PORTSC_PP;
+			spin_delay(50*1000);
+		}
+		
+		ack_port_changes(portsc);
+		
+		uint32_t v = *portsc;
+		if (!(v & PORTSC_CCS)) continue;
+		
+		if (!port_reset(portsc)) {
+			print((char*)"Port reset timeout");
+			continue;
+		}
+		
+		uint32_t v_after = *portsc;
+		if (!(v_after & PORTSC_CCS)) {
+			print((char*)"Port not enabled after reset; PORTSC:");
+			to_hex(v_after, str); print(str);
+			continue;
+		}
+		
+		ring_push_cmd(&cr, (9u<<10), 0, 0);
+		doorbell32[0] = 0;
+		
+		timeout = 1000000;
+		bool got_response = false;
+		uint32_t slot_id;
+		
+		while (timeout-- > 0) {
+			TRB* evt = (TRB*)&er_virt[erdp_index];
+			uint32_t ctrl = evt->control;
+			uint32_t cyc = ctrl & 1u;
+			
+			if (cyc != ccs) {
+				// Event not ready yet
+				for (volatile int i = 0; i < 10; i++);
+				continue;
+			}
+			
+			uint32_t type = (ctrl >> 10) & 0x3F;
+			print("Event type:");
+			to_str(type, str);
+			print(str);
+			
+			if (type == 34) {
+				print("Port Status Change Event");
+				
+				erdp_index = (erdp_index + 1) % 256;
+				if (erdp_index == 0) ccs ^= 1;
+				
+				uint64_t new_erdp = er_phys + (erdp_index * 16);
+				*erdp = new_erdp | (1ull << 3);
+				continue;
+			}else if (type == 33) {
+				uint32_t code = (evt->status >> 24) & 0xFF;
+				print("Completion code:");
+				to_str(code, str); 
+				print(str);
+				
+				if (code == 1) {  // Success
+					slot_id = (ctrl >> 24) & 0xFF;
+					print("Slot enabled! ID="); 
+					to_str(slot_id, str); 
+					print(str);
+				} else {
+					print("Enable Slot FAILED with code:");
+					to_str(code, str);
+					print(str);
+				}
+				
+				// Advance ERDP
+				erdp_index = (erdp_index + 1) % 256;
+				if (erdp_index == 0) ccs ^= 1;
+				
+				uint64_t new_erdp = er_phys + (erdp_index * 16);
+				*erdp = new_erdp | (1ull << 3);
+				
+				got_response = true;
+				break;
+			}else {
+				print("Unexpected event type");
+				
+				erdp_index = (erdp_index + 1) % 256;
+				if (erdp_index == 0) ccs ^= 1;
+				
+				uint64_t new_erdp = er_phys + (erdp_index * 16);
+				*erdp = new_erdp | (1ull << 3);
+			}
+		}
+		
+		if (!got_response) {
+			print("Timeout waiting for Enable Slot response");
+			continue;
+		}
+		
+		
+		
+		
+		
+		// here we have the item that seems to be ready?
+		
+		struct Ring ep0;
+		ring_init(&ep0);
+		uint64_t ep0_ring_phys = ep0.phys;
+		
+		
+		uint32_t speed = (v >> 10) & 0xF;
+		
+		volatile uint64_t* input_ctx_virt = alloc_table();
+		uint32_t input_ctx_phys = (uint64_t)input_ctx_virt-HHDM;
+		
+		
+		volatile InputControlCtx *data = (volatile InputControlCtx*)input_ctx_virt;
+		data->add_flags = (1 << 0) | (1 << 1);
+		
+		volatile SlotCtx* slot_ctx = (volatile SlotCtx*)(input_ctx_virt+0x20);
+		
+		slot_ctx->route_string = 0;
+		slot_ctx->speed = speed; // e.g. 3 = full speed, 4 = high speed, etc.
+		slot_ctx->port_num = i + 1;  // 1-based per xHCI spec
+		
+		volatile struct EndpointCtx *ep0_ctx = (volatile struct EndpointCtx *)((uintptr_t)input_ctx_virt + 0x40);
+		
+		#define EP_TYPE_CONTROL 4
+		
+		ep0_ctx->ep_state = 0;
+		ep0_ctx->ep_flags =
+			(EP_TYPE_CONTROL << 3) |      // Endpoint Type (Control)
+			(64 << 16);                   // Max Packet Size (HS)
+		ep0_ctx->tr_deq_ptr = ep0_ring_phys | 1; // bit 0 = DCS
+		ep0_ctx->avg_trb_len = 8;
+		ep0_ctx->max_esit_hi = 0;
+		
+		ring_push_cmd(&cr, (11u << 10) | (slot_id << 24), 
+		              (uint32_t)(input_ctx_phys & 0xFFFFFFFF),
+		              (uint32_t)(input_ctx_phys >> 32));
+		doorbell32[0] = 0;
+	}
+	
+	print("Port scan complete.");
 	
 	print("Finished.");
 	hcf();
