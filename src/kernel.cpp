@@ -636,6 +636,51 @@ struct USBDevice {
 	volatile uint64_t* device_ctx;
 };
 
+
+struct USB_Response {
+	bool gotresponse;
+	TRB* event;
+	uint32_t type;
+	uint32_t ctrl;
+};
+
+volatile TRB* er_virt;
+uint8_t ccs = 1; // Consumer Cycle State for event ring
+uint8_t erdp_index = 0;
+volatile uint64_t* erdp;
+uint64_t er_phys;
+
+USB_Response get_usb_response(int timeout = 1000000) {
+	while (timeout-- > 0) {
+		TRB* evt = (TRB*)&er_virt[erdp_index];
+		uint32_t ctrl = evt->control;
+		uint32_t cyc = ctrl & 1u;
+		
+		if (cyc != ccs) {
+			// Event not ready yet
+			for (volatile int i = 0; i < 10; i++);
+			continue;
+		}
+		
+		// Advance ERDP
+		erdp_index = (erdp_index + 1) % 256;
+		if (erdp_index == 0) ccs ^= 1;
+		uint64_t new_erdp = er_phys + (erdp_index * 16);
+		*erdp = new_erdp | (1ull << 3);
+		
+		// return info
+		uint32_t type = (ctrl >> 10) & 0x3F;
+		
+		USB_Response resp = {};
+		resp.gotresponse = true;
+		resp.event = evt;
+		resp.type = type;
+		resp.ctrl = ctrl;
+		return resp;
+	}
+	return {false};
+}
+
 extern "C" void kmain(void) {
 	if (!LIMINE_BASE_REVISION_SUPPORTED) hcf();
 	if (!fb_req.response || fb_req.response->framebuffer_count < 1) hcf();
@@ -905,7 +950,7 @@ extern "C" void kmain(void) {
 	volatile uint32_t* imod   = (volatile uint32_t*)(rt_base + 0x20 + 0x04);
 	volatile uint32_t* erstsz = (volatile uint32_t*)(rt_base + 0x20 + 0x08);
 	volatile uint64_t* erstba = (volatile uint64_t*)(rt_base + 0x20 + 0x10);
-	volatile uint64_t* erdp   = (volatile uint64_t*)(rt_base + 0x20 + 0x18);
+	erdp   = (volatile uint64_t*)(rt_base + 0x20 + 0x18);
 	
 	while (!(ops->usbsts & 1)) { }
 	ops->usbcmd |= (1u << 1);
@@ -916,8 +961,8 @@ extern "C" void kmain(void) {
 	ring_init(&cr);
 	ops->crcr = (cr.phys & ~0x3FULL) | 1;
 	
-	volatile TRB* er_virt = (volatile TRB*)alloc_table();
-	uint64_t er_phys = ((uint64_t)er_virt) - HHDM;
+	er_virt = (volatile TRB*)alloc_table();
+	er_phys = ((uint64_t)er_virt) - HHDM;
 	for (int i = 0; i < 256; i++) {
 		er_virt[i].parameter = 0;
 		er_virt[i].status    = 0;
@@ -974,13 +1019,43 @@ extern "C" void kmain(void) {
 	print((char*)"Controller running!");
 	
 	uint8_t max_ports = (hcs1 >> 24) & 0xFF;
-	uint8_t ccs = 1;
-	uint8_t erdp_index = 0;
+	ccs = 1;
+	erdp_index = 0;
 	
 	bool needs_ppc = (hcc1 & (1u << 3));
 	
 	if (needs_ppc) {
 		print((char*)"We will be powering ports manually.");
+	}
+	
+	print("Waiting for device connections...");
+	size_t timeout = 2000000; // Wait up to ~2 seconds
+	while (timeout-- > 0) {
+		for (volatile int i = 0; i < 1000; i++);
+		
+		USB_Response resp = get_usb_response(1);
+		if (!resp.gotresponse) {
+			continue;
+		}
+		if (resp.type != 34) {
+			continue;
+		}
+		
+		// Handle PSC event
+		uint32_t port_id = (resp.event->parameter >> 24) & 0xFF;
+		print("Port Status Change on port ");
+		to_str(port_id, str); print(str);
+		
+		volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)ops + 0x400 + (port_id-1) * 0x10);
+		uint32_t psc = *portsc;
+		
+		// Check if device connected
+		if (psc & 1u) {  // CCS bit
+			print("Device NOW connected!");
+			// Clear CSC bit
+			*portsc |= (1u << 17);
+			// Re-run your port enumeration logic here
+		}
 	}
 	
 	print((char*)"Scanning ports...");
@@ -1051,56 +1126,35 @@ extern "C" void kmain(void) {
 		ring_push_cmd(&cr, (9u<<10), 0, 0);
 		doorbell32[0] = 0;
 		
-		size_t timeout = 1000000;
-		bool got_response = false;
-		uint32_t slot_id = 0;
-		
-		while (timeout-- > 0) {
-			TRB* evt = (TRB*)&er_virt[erdp_index];
-			uint32_t ctrl = evt->control;
-			uint32_t cyc = ctrl & 1u;
-			
-			if (cyc != ccs) {
-				for (volatile int j = 0; j < 10; j++);
-				continue;
-			}
-			
-			uint32_t type = (ctrl >> 10) & 0x3F;
-			
-			if (type == 34) {
-				erdp_index = (erdp_index + 1) % 256;
-				if (erdp_index == 0) ccs ^= 1;
-				uint64_t new_erdp = er_phys + (erdp_index * 16);
-				*erdp = new_erdp | (1ull << 3);
-				continue;
-			} else if (type == 33) {
-				uint32_t code = (evt->status >> 24) & 0xFF;
-				
-				if (code == 1) {
-					slot_id = (ctrl >> 24) & 0xFF;
-					print((char*)"Slot enabled! ID="); 
-					to_str(slot_id, str); 
-					print(str);
-				} else {
-					print((char*)"Enable Slot FAILED");
-				}
-				
-				erdp_index = (erdp_index + 1) % 256;
-				if (erdp_index == 0) ccs ^= 1;
-				uint64_t new_erdp = er_phys + (erdp_index * 16);
-				*erdp = new_erdp | (1ull << 3);
-				got_response = true;
+		USB_Response resp = {false};
+		while (true) {
+			USB_Response tempresp = get_usb_response();
+			if (!tempresp.gotresponse) {
 				break;
-			} else {
-				erdp_index = (erdp_index + 1) % 256;
-				if (erdp_index == 0) ccs ^= 1;
-				uint64_t new_erdp = er_phys + (erdp_index * 16);
-				*erdp = new_erdp | (1ull << 3);
+			}
+			if (tempresp.type == 33) {
+				resp = tempresp;
+				break;
 			}
 		}
 		
-		if (!got_response || slot_id == 0) {
-			print((char*)"Timeout waiting for Enable Slot");
+		if (!resp.gotresponse) {
+			print("Did not get response to slot enable");
+			continue;
+		}
+		
+		uint32_t slot_id;
+		uint32_t code = (resp.event->status >> 24) & 0xFF;
+		
+		if (code == 1) {
+			slot_id = (resp.ctrl >> 24) & 0xFF;
+			print("Slot enabled! ID="); 
+			to_str(slot_id, str); 
+			print(str);
+		} else {
+			print("Enable Slot FAILED with code:");
+			to_str(code, str);
+			print(str);
 			continue;
 		}
 		
@@ -1160,52 +1214,25 @@ extern "C" void kmain(void) {
 		              (uint32_t)(input_ctx_phys >> 32));
 		doorbell32[0] = 0;
 		
-		timeout = 1000000;
-		got_response = false;
-		
-		while (timeout-- > 0) {
-			TRB* evt = (TRB*)&er_virt[erdp_index];
-			uint32_t ctrl = evt->control;
-			uint32_t cyc = ctrl & 1u;
-			
-			if (cyc != ccs) {
-				for (volatile int j = 0; j < 10; j++);
-				continue;
-			}
-			
-			uint32_t type = (ctrl >> 10) & 0x3F;
-			
-			if (type == 33) {
-				uint32_t code = (evt->status >> 24) & 0xFF;
-				
-				print((char*)"Address completion code: ");
-				to_str(code, str);
-				print(str);
-				
-				if (code == 1) {
-					print((char*)"Device addressed!");
-				} else {
-					print((char*)"Address Device FAILED");
-					to_hex(evt->parameter, str);
-					print(str);
-				}
-				
-				erdp_index = (erdp_index + 1) % 256;
-				if (erdp_index == 0) ccs ^= 1;
-				uint64_t new_erdp = er_phys + (erdp_index * 16);
-				*erdp = new_erdp | (1ull << 3);
-				got_response = true;
-				break;
-			} else {
-				erdp_index = (erdp_index + 1) % 256;
-				if (erdp_index == 0) ccs ^= 1;
-				uint64_t new_erdp = er_phys + (erdp_index * 16);
-				*erdp = new_erdp | (1ull << 3);
-			}
+		resp = (USB_Response){false};
+		for (;;) {
+			USB_Response tmp = get_usb_response();
+			if (!tmp.gotresponse) break;
+			if (tmp.type == 33) { resp = tmp; break; } // Command Completion Event
 		}
 		
-		if (!got_response) {
-			print((char*)"Timeout waiting for Address Device");
+		if (!resp.gotresponse) {
+			print("Did not get response to Address Device");
+			continue;
+		}
+		
+		code = (resp.event->status >> 24) & 0xFF;
+		if (code == 1) {
+			print("Address Device: success");
+		} else {
+			print("Address Device failed, code:");
+			to_str(code, str); print(str);
+			// (Optional) dump sc32[0..3], ep32[0..4] here for quick forensics
 			continue;
 		}
 		
@@ -1237,35 +1264,23 @@ extern "C" void kmain(void) {
 		
 		doorbell32[slot_id] = 1;  // Ring EP0
 		
-		timeout = 1000000;
-		got_response = false;
 		
-		while (timeout-- > 0) {
-			TRB* evt = (TRB*)&er_virt[erdp_index];
-			uint32_t ctrl = evt->control;
-			uint32_t cyc = ctrl & 1u;
-			
-			if (cyc != ccs) {
-				for (volatile int j = 0; j < 10; j++);
-				continue;
+		resp = (USB_Response){false};
+		for (;;) {
+			USB_Response tmp = get_usb_response();
+			print("Resp...");
+			if (tmp.gotresponse) {
+				print("has resp");
 			}
-			
-			uint32_t type = (ctrl >> 10) & 0x3F;
-			
-			if (type == 32 || type == 33) {  // Transfer or Command completion
-				erdp_index = (erdp_index + 1) % 256;
-				if (erdp_index == 0) ccs ^= 1;
-				uint64_t new_erdp = er_phys + (erdp_index * 16);
-				*erdp = new_erdp | (1ull << 3);
-				got_response = true;
-				break;
-			} else {
-				erdp_index = (erdp_index + 1) % 256;
-				if (erdp_index == 0) ccs ^= 1;
-				uint64_t new_erdp = er_phys + (erdp_index * 16);
-				*erdp = new_erdp | (1ull << 3);
-			}
+			if (!tmp.gotresponse) break;
+			if (tmp.type == 33 || tmp.type == 32) { resp = tmp; break; }
 		}
+		
+		// TELL KAI ABOUT THIS.
+//		if (!resp.gotresponse) {
+//			print("Did not get response to Boot Protocol");
+//			continue;
+//		}
 		
 		print((char*)"Boot protocol set");
 		
@@ -1355,78 +1370,49 @@ extern "C" void kmain(void) {
 		              (uint32_t)(input_ctx2_phys >> 32));
 		doorbell32[0] = 0;
 		
-		timeout = 1000000;
-		got_response = false;
-		
-		while (timeout-- > 0) {
-			TRB* evt = (TRB*)&er_virt[erdp_index];
-			uint32_t ctrl = evt->control;
-			uint32_t cyc = ctrl & 1u;
-			
-			if (cyc != ccs) {
-				for (volatile int j = 0; j < 10; j++);
-				continue;
-			}
-			
-			uint32_t type = (ctrl >> 10) & 0x3F;
-			
-			if (type == 33) {
-				uint32_t code = (evt->status >> 24) & 0xFF;
-				
-				print((char*)"Configure EP code: ");
-				to_str(code, str);
-				print(str);
-				
-				if (code == 1) {
-					print((char*)"Endpoint configured!");
-				} else {
-					print((char*)"Configure Endpoint FAILED");
-					print((char*)"TRB pointer:");
-					to_hex(evt->parameter, str);
-					print(str);
-					print((char*)"Slot ID:");
-					to_str(slot_id, str);
-					print(str);
-					print((char*)"Input ctx phys:");
-					to_hex(input_ctx2_phys, str);
-					print(str);
-					print((char*)"Add flags:");
-					to_hex(icc2->add_flags, str);
-					print(str);
-					print((char*)"Drop flags:");
-					to_hex(icc2->drop_flags, str);
-					print(str);
-					print((char*)"EP1 DW0:");
-					to_hex(ep1_ctx_dw[0], str);
-					print(str);
-					print((char*)"EP1 DW1:");
-					to_hex(ep1_ctx_dw[1], str);
-					print(str);
-					print((char*)"Ring phys:");
-					to_hex(kbd_device.kbd_ring.phys, str);
-					print(str);
-				}
-				
-				erdp_index = (erdp_index + 1) % 256;
-				if (erdp_index == 0) ccs ^= 1;
-				uint64_t new_erdp = er_phys + (erdp_index * 16);
-				*erdp = new_erdp | (1ull << 3);
-				got_response = true;
-				break;
-			} else {
-				erdp_index = (erdp_index + 1) % 256;
-				if (erdp_index == 0) ccs ^= 1;
-				uint64_t new_erdp = er_phys + (erdp_index * 16);
-				*erdp = new_erdp | (1ull << 3);
-			}
+		resp = (USB_Response){false};
+		for (;;) {
+			USB_Response tmp = get_usb_response();
+			if (!tmp.gotresponse) break;
+			if (tmp.type == 33) { resp = tmp; break; } // Command Completion Event
 		}
 		
-		if (!got_response) {
-			print((char*)"Timeout configuring endpoint");
+		if (!resp.gotresponse) {
+			print("Timeout configuing endpoint");
 			continue;
 		}
 		
-		print((char*)"Endpoint configured successfully!");
+		code = (resp.event->status >> 24) & 0xFF;
+		if (code == 1) {
+			print("Endpoint configured!");
+		} else {
+			print((char*)"Configure Endpoint FAILED");
+			print((char*)"TRB pointer:");
+			to_hex(resp.event->parameter, str);
+			print(str);
+			print((char*)"Slot ID:");
+			to_str(slot_id, str);
+			print(str);
+			print((char*)"Input ctx phys:");
+			to_hex(input_ctx2_phys, str);
+			print(str);
+			print((char*)"Add flags:");
+			to_hex(icc2->add_flags, str);
+			print(str);
+			print((char*)"Drop flags:");
+			to_hex(icc2->drop_flags, str);
+			print(str);
+			print((char*)"EP1 DW0:");
+			to_hex(ep1_ctx_dw[0], str);
+			print(str);
+			print((char*)"EP1 DW1:");
+			to_hex(ep1_ctx_dw[1], str);
+			print(str);
+			print((char*)"Ring phys:");
+			to_hex(kbd_device.kbd_ring.phys, str);
+			print(str);
+			continue;
+		}
 		
 		// Queue initial transfer requests for keyboard
 		volatile uint8_t* kbd_buffer1 = (volatile uint8_t*)alloc_table();
@@ -1514,9 +1500,8 @@ extern "C" void kmain(void) {
 	uint64_t loop_count = 0;
 	
 	while (true) {
-		loop_count++;
+		loop_count ++;
 		
-		// Show we're still alive every million loops
 		if (loop_count % 10000000 == 0) {
 			print((char*)"Still polling... Events:");
 			to_str(event_count, str);
@@ -1535,29 +1520,22 @@ extern "C" void kmain(void) {
 			print(str);
 		}
 		
-		TRB* evt = (TRB*)&er_virt[erdp_index];
-		uint32_t ctrl = evt->control;
-		uint32_t cyc = ctrl & 1u;
-		
-		if (cyc != ccs) {
-			continue;
-		}
+		USB_Response resp = get_usb_response(1);
+		if (!resp.gotresponse) { continue; }
 		
 		event_count++;
 		if (event_count <= 10) {
 			print((char*)"Event received! Type:");
-			to_str((ctrl >> 10) & 0x3F, str);
+			to_str(resp.type, str);
 			print(str);
 		}
 		
-		uint32_t type = (ctrl >> 10) & 0x3F;
-		
-		if (type == 32) {  // Transfer Event
+		if (resp.type == 32) {  // Transfer Event
 			transfer_count++;
 			
-			uint32_t code = (evt->status >> 24) & 0xFF;
-			uint64_t trb_ptr = evt->parameter;
-			uint32_t transfer_len = evt->status & 0xFFFFFF;
+			uint32_t code = (resp.event->status >> 24) & 0xFF;
+			uint64_t trb_ptr = resp.event->parameter;
+			uint32_t transfer_len = resp.event->status & 0xFFFFFF;
 			
 			print((char*)"Transfer event! Code:");
 			to_str(code, str);
@@ -1640,23 +1618,12 @@ extern "C" void kmain(void) {
 			} else {
 				print((char*)"Transfer error, not requeueing");
 			}
-			
-			erdp_index = (erdp_index + 1) % 256;
-			if (erdp_index == 0) ccs ^= 1;
-			uint64_t new_erdp = er_phys + (erdp_index * 16);
-			*erdp = new_erdp | (1ull << 3);
-		} else {
-			// Other event types
+		}else {
 			if (event_count <= 10) {
 				print((char*)"Other event type:");
-				to_str(type, str);
+				to_str(resp.type, str);
 				print(str);
 			}
-			
-			erdp_index = (erdp_index + 1) % 256;
-			if (erdp_index == 0) ccs ^= 1;
-			uint64_t new_erdp = er_phys + (erdp_index * 16);
-			*erdp = new_erdp | (1ull << 3);
 		}
 	}
 	
