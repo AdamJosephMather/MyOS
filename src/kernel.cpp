@@ -1117,7 +1117,7 @@ extern "C" void kmain(void) {
 		}
 		
 		uint32_t v_after = *portsc;
-		if (!(v_after & PORTSC_PED)) {
+		if (!(v_after & PORTSC_CCS)) {
 			print((char*)"Port not enabled after reset");
 			continue;
 		}
