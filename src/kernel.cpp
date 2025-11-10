@@ -62,6 +62,24 @@ static const char map_shift[0x60] = {
 /*50*/'2','3','0','.', 0,  0,  0,  0,  0,  0
 };
 
+// USB HID keycodes to ASCII (unshifted)
+static const char hid_to_ascii[256] = {
+	0, 0, 0, 0, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l',
+	'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+	'1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
+	'\n', 27, '\b', '\t', ' ', '-', '=', '[', ']', '\\', 0, ';', '\'', '`', ',', '.', '/',
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // F-keys
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // more
+};
+
+// USB HID keycodes to ASCII (shifted)
+static const char hid_to_ascii_shift[256] = {
+	0, 0, 0, 0, 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L',
+	'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+	'!', '@', '#', '$', '%', '^', '&', '*', '(', ')',
+	'\n', 27, '\b', '\t', ' ', '_', '+', '{', '}', '|', 0, ':', '"', '~', '<', '>', '?',
+};
+
 static inline void hcf() {
 	for (;;) { __asm__ __volatile__("hlt"); }
 }
@@ -138,11 +156,6 @@ static inline void fill_screen_fast(uint32_t argb) {
 	}
 }
 
-
-
-
-
-
 static inline uint32_t inl(uint16_t port) {
 	uint32_t ret;
 	__asm__ volatile ("inl %1, %0" : "=a"(ret) : "Nd"(port));
@@ -152,13 +165,6 @@ static inline uint32_t inl(uint16_t port) {
 static inline void outl(uint16_t port, uint32_t val) {
 	__asm__ volatile ("outl %0, %1" : : "a"(val), "Nd"(port));
 }
-
-
-
-
-
-
-
 
 #define PCI_ECAM_VIRT_BASE 0xFFFF900000000000ULL
 
@@ -184,24 +190,18 @@ struct MCFGEntry {
 
 struct MCFGHeader {
 	struct ACPISDTHeader header;
-	uint64_t reserved;           // <-- required padding
+	uint64_t reserved;
 	struct MCFGEntry entries[];
 } __attribute__((packed));
 
-// returns a DWORD pointer in ECAM
 inline volatile uint32_t* pci_cfg_ptr32(uint64_t virt_base, uint8_t start_bus, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off) {
-	// ECAM: 1MiB per bus, 32 devs, 8 funcs, 4KiB per fn
-	// Validate offset is DWORD-aligned and within 4KiB
-	// (you can drop these checks in release):
 	if ((off & 3) || off > 0xFFC) hcf();
-
 	uint64_t addr = virt_base
-				  + ((uint64_t)(bus - start_bus) << 20)  // (bus - start)*1MiB
-				  + ((uint64_t)dev << 15)                // dev*32*4KiB
-				  + ((uint64_t)fn  << 12)                // fn*4KiB
+				  + ((uint64_t)(bus - start_bus) << 20)
+				  + ((uint64_t)dev << 15)
+				  + ((uint64_t)fn  << 12)
 				  + off;
-
-	return (volatile uint32_t*)addr;  // DO NOT add PCI_ECAM_VIRT_BASE again
+	return (volatile uint32_t*)addr;
 }
 
 inline volatile uint16_t* pci_cfg_ptr16(uint64_t virt_base, uint8_t start_bus, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off) {
@@ -213,7 +213,6 @@ inline volatile uint16_t* pci_cfg_ptr16(uint64_t virt_base, uint8_t start_bus, u
 				  + off;
 	return (volatile uint16_t*)addr;
 }
-
 
 uint32_t pci_cfg_read32(uint64_t virt_base, uint8_t start_bus, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off) {
 	volatile uint32_t* val = pci_cfg_ptr32(virt_base, start_bus, bus, dev, fn, off);
@@ -257,7 +256,6 @@ void to_str(uint64_t value, char* buffer) {
 	}
 }
 
-
 void draw_char(int x, int y, char c, uint32_t color) {
 	const uint8_t* glyph = font8x8_basic[(int)c];
 	for (int row = 0; row < 8; row++) {
@@ -270,8 +268,21 @@ void draw_char(int x, int y, char c, uint32_t color) {
 }
 
 int current_print_line = 0;
+int max_print_lines = 0;
 
 void print(char* buffer) {
+	// Calculate max lines based on screen height
+	if (max_print_lines == 0) {
+		max_print_lines = fb->height / 10;  // 10 pixels per line
+	}
+	
+	// Wrap around to top if we've reached the bottom
+	if (current_print_line >= max_print_lines) {
+		current_print_line = 0;
+		// Clear the screen
+		fill_screen_fast(0x00000000);
+	}
+	
 	uint64_t i = 0;
 	while (true) {
 		char c = buffer[i];
@@ -281,7 +292,6 @@ void print(char* buffer) {
 		draw_char(i*8, current_print_line*10, c, 0xFFFFFFFF);
 		i++;
 	}
-	
 	current_print_line ++;
 }
 
@@ -300,15 +310,6 @@ void to_hex(uint64_t value, char* buffer) {
 	buffer[n--] = '0';
 }
 
-
-
-
-
-
-
-
-
-
 #define PAGE_SIZE 0x1000
 
 static inline uint64_t read_cr3() {
@@ -319,7 +320,7 @@ static inline uint64_t read_cr3() {
 
 static uint64_t next_free_phys_page = 0;
 static uint64_t max_free_phys_page = 0;
-const uint64_t GUARD = 2*1024*1024; // 2 MiB guard
+const uint64_t GUARD = 2*1024*1024;
 static uint64_t max_hhdm_size = 0;
 
 void init_physical_allocator() {
@@ -341,22 +342,19 @@ void init_physical_allocator() {
 	next_free_phys_page = best_base;
 	max_free_phys_page = best_base+best_len;
 	
-//	if (debug) {
 	char str[64];
-	
 	to_hex(next_free_phys_page, str);
-	print("Next free phys page");
+	print((char*)"Next free phys page");
 	print(str);
 	
 	to_hex(max_free_phys_page, str);
-	print("Max free phys page");
+	print((char*)"Max free phys page");
 	print(str);
-//	}
 }
 
 uint64_t alloc_phys_page() {
 	if (next_free_phys_page >= max_free_phys_page) {
-		print("OUT OF MEMORY!");
+		print((char*)"OUT OF MEMORY!");
 		hcf();
 	}
 	
@@ -399,10 +397,9 @@ static inline volatile uint64_t *alloc_table(void) {
 	return virt;
 }
 
-static inline volatile uint64_t *descend(volatile uint64_t *parent, size_t idx, int level /*3=PDPT,2=PD*/) {
+static inline volatile uint64_t *descend(volatile uint64_t *parent, size_t idx, int level) {
 	uint64_t e = parent[idx];
 
-	// Not present -> allocate next-level table
 	if (!(e & PRESENT)) {
 		volatile uint64_t *child = alloc_table();
 		uint64_t phys = (uint64_t)child - HHDM;
@@ -410,39 +407,36 @@ static inline volatile uint64_t *descend(volatile uint64_t *parent, size_t idx, 
 		return child;
 	}
 
-	// Split 1 GiB huge (PDPT->PD)
 	if (level == 3 && (e & HUGE)) {
 		uint64_t flags = e & ~(PTE_ADDR_MASK | HUGE);
-		uint64_t base  = e & PDP_1G_ADDR_MASK;          // 1 GiB-aligned
+		uint64_t base  = e & PDP_1G_ADDR_MASK;
 		volatile uint64_t *pd = alloc_table();
 		for (int i = 0; i < 512; i++)
-			pd[i] = (base + ((uint64_t)i << 21)) | flags | PRESENT | HUGE;  // 2 MiB each
+			pd[i] = (base + ((uint64_t)i << 21)) | flags | PRESENT | HUGE;
 		uint64_t phys = (uint64_t)pd - HHDM;
 		parent[idx] = (phys & PTE_ADDR_MASK) | (flags & ~HUGE) | PRESENT | WRITABLE;
 		return pd;
 	}
 
-	// Split 2 MiB huge (PD->PT)
 	if (level == 2 && (e & HUGE)) {
 		uint64_t flags = e & ~(PTE_ADDR_MASK | HUGE);
-		uint64_t base  = e & PD_2M_ADDR_MASK;           // 2 MiB-aligned
+		uint64_t base  = e & PD_2M_ADDR_MASK;
 		volatile uint64_t *pt = alloc_table();
 		for (int i = 0; i < 512; i++)
-			pt[i] = (base + ((uint64_t)i << 12)) | flags | PRESENT;         // 4 KiB each
+			pt[i] = (base + ((uint64_t)i << 12)) | flags | PRESENT;
 		uint64_t phys = (uint64_t)pt - HHDM;
 		parent[idx] = (phys & PTE_ADDR_MASK) | (flags & ~HUGE) | PRESENT | WRITABLE;
 		return pt;
 	}
 
-	// Already a pointer to the next level
 	return (volatile uint64_t *)(HHDM + (e & PTE_ADDR_MASK));
 }
 
 void map_page(uint64_t va, uint64_t pa, uint64_t flags) {
 	volatile uint64_t *pml4 = (volatile uint64_t *)(HHDM + (read_cr3() & PTE_ADDR_MASK));
-	volatile uint64_t *pdpt = descend(pml4, PML4_INDEX(va), 4);  // top level is not huge
-	volatile uint64_t *pd   = descend(pdpt, PDPT_INDEX(va), 3);  // split 1 GiB if needed
-	volatile uint64_t *pt   = descend(pd,   PD_INDEX(va),   2);  // split 2 MiB if needed
+	volatile uint64_t *pdpt = descend(pml4, PML4_INDEX(va), 4);
+	volatile uint64_t *pd   = descend(pdpt, PDPT_INDEX(va), 3);
+	volatile uint64_t *pt   = descend(pd,   PD_INDEX(va),   2);
 	
 	pt[PT_INDEX(va)] = (pa & PTE_ADDR_MASK) | (flags | PRESENT);
 	asm volatile("invlpg (%0)" :: "r"(va) : "memory");
@@ -468,23 +462,22 @@ void map_region(uint64_t virt_start, uint64_t phys_start, size_t length, uint64_
 	}
 }
 
-uint64_t PCI_ECAM_VA_BASE =      0xFFFF'8000'0000'0000ULL; // pick a canonical kernel VA
-uint64_t PCI_ECAM_SEG_STRIDE              = 0x10000000ULL; // 256 MiB
+uint64_t PCI_ECAM_VA_BASE = 0xFFFF'8000'0000'0000ULL;
+uint64_t PCI_ECAM_SEG_STRIDE = 0x10000000ULL;
 
-uint64_t PCI_MMIO_VA_BASE =      0xFFFF'9000'0000'0000ULL;  // canonical
-uint64_t USB_VA_BASE = (PCI_MMIO_VA_BASE + 0x0010'0000ULL); // leave some gap
-
+uint64_t PCI_MMIO_VA_BASE = 0xFFFF'9000'0000'0000ULL;
+uint64_t USB_VA_BASE = (PCI_MMIO_VA_BASE + 0x0010'0000ULL);
 
 struct XHCIOpRegs {
-	volatile uint32_t usbcmd;       // 00h
-	volatile uint32_t usbsts;       // 04h
-	volatile uint32_t pagesize;     // 08h (RO capabilities)
-	volatile uint8_t  reserved1[8]; // 0Ch
-	volatile uint32_t dnctrl;       // 14h
-	volatile uint64_t crcr;         // 18h
+	volatile uint32_t usbcmd;
+	volatile uint32_t usbsts;
+	volatile uint32_t pagesize;
+	volatile uint8_t  reserved1[8];
+	volatile uint32_t dnctrl;
+	volatile uint64_t crcr;
 	volatile uint8_t  reserved2[16];
-	volatile uint64_t dcbaap;       // 30h
-	volatile uint32_t config;       // 38h
+	volatile uint64_t dcbaap;
+	volatile uint32_t config;
 };
 
 struct TRB {
@@ -500,111 +493,99 @@ struct ERSTEntry {
 } __attribute__((packed, aligned(16)));
 
 struct Ring {
-	volatile TRB *trb;   // 256 entries: 0..254 data, 255 = Link TRB
+	volatile TRB *trb;
 	uint64_t phys;
-	uint32_t enq;        // 0..254
-	uint8_t  pcs;        // Producer Cycle State (1 initially)
+	uint32_t enq;
+	uint8_t  pcs;
 };
 
 struct InputControlCtx {
-	uint32_t drop_flags;    // which contexts to drop
-	uint32_t add_flags;     // which contexts to add
+	uint32_t drop_flags;
+	uint32_t add_flags;
 	uint32_t rsvd[6];
 };
 
 struct SlotCtx {
 	uint32_t route_string;
-	uint32_t speed;      // set per-port speed
+	uint32_t speed;
 	uint32_t rsvd2;
 	uint32_t rsvd3;
 	uint32_t tt_hub_slotid;
 	uint32_t tt_portnum;
-	uint32_t port_num;   // which root port this device is on
+	uint32_t port_num;
 	uint32_t rsvd4;
 };
 
 struct EndpointCtx {
-	uint32_t ep_state;       // Dword 0
-	uint32_t ep_flags;       // Dword 1
-	uint64_t tr_deq_ptr;     // Dword 2-3
-	uint32_t avg_trb_len;    // Dword 4
-	uint32_t max_esit_hi;    // Dword 5
-	uint32_t reserved[2];    // Dword 6-7
+	uint32_t ep_state;
+	uint32_t ep_flags;
+	uint64_t tr_deq_ptr;
+	uint32_t avg_trb_len;
+	uint32_t max_esit_hi;
+	uint32_t reserved[2];
 } __attribute__((packed));
 
 void ring_init(struct Ring *r) {
-	r->trb = (volatile TRB*)alloc_table();     // 4 KiB
+	r->trb = (volatile TRB*)alloc_table();
 	r->phys = (uint64_t)r->trb - HHDM;
 	r->enq = 0;
 	r->pcs = 1;
 
-	// All TRBs must start with cycle=0
 	for (int i = 0; i < 256; i++) r->trb[i].control = 0;
 
-	// Link TRB at 255 -> back to start, Toggle Cycle
 	r->trb[255].parameter = r->phys;
 	r->trb[255].status = 0;
-	r->trb[255].control = (6u<<10) | (1u<<1);  // Type=Link, TC=1, C=0
+	r->trb[255].control = (6u<<10) | (1u<<1);
 }
 
 void ring_push_cmd(struct Ring *r, uint32_t ctrl, uint64_t param, uint32_t status) {
 	volatile TRB *t = &r->trb[r->enq];
 	t->parameter = param;
 	t->status    = status;
-	t->control   = (ctrl & ~1u) | r->pcs;  // set Cycle=PCS
+	t->control   = (ctrl & ~1u) | r->pcs;
 
-	if (++r->enq == 255) {                 // wrap across Link TRB
+	if (++r->enq == 255) {
 		r->enq = 0;
 		r->pcs ^= 1;
 	}
 }
 
-// NEW: tiny spin delay; tuned big enough for "ms-ish" waits on boot
 static inline void spin_delay(volatile uint64_t iters) {
 	for (volatile uint64_t i=0; i<iters; ++i) { __asm__ __volatile__("pause"); }
 }
 
-// NEW: walk xECP and claim OS ownership; also kill legacy SMIs
 static void xhci_legacy_handoff(uint32_t hcc1, uint64_t mmio_base) {
-	uint32_t xecp_dw = (hcc1 >> 16) & 0xFFFF;   // dword offset from MMIO base
+	uint32_t xecp_dw = (hcc1 >> 16) & 0xFFFF;
 	while (xecp_dw) {
 		volatile uint32_t *ec = (volatile uint32_t*)(mmio_base + (uint64_t)xecp_dw*4);
 		uint32_t hdr   = ec[0];
 		uint32_t capid =  hdr        & 0xFF;
 		uint32_t next  = (hdr >> 8)  & 0xFF;
 
-		if (capid == 1) { // USB Legacy Support
-			volatile uint32_t *usblegsup    = ec + 0;   // xECP + 0x00
-			volatile uint32_t *usblegctlsts = ec + 1;   // xECP + 0x04
+		if (capid == 1) {
+			volatile uint32_t *usblegsup    = ec + 0;
+			volatile uint32_t *usblegctlsts = ec + 1;
 
-			// Set OS Owned (bit 24)
 			*usblegsup |= (1u << 24);
-			// Wait BIOS Owned (bit 16) to clear
 			for (int t=0; t<1000000 && (*usblegsup & (1u<<16)); ++t) { __asm__ __volatile__("pause"); }
 
-			// Disable legacy SMIs and clear any pending RW1C
-			*usblegctlsts = 0;           // clear enables (RW)
-			*usblegctlsts = 0xFFFFFFFF;  // clear status (RW1C)
+			*usblegctlsts = 0;
+			*usblegctlsts = 0xFFFFFFFF;
 			break;
 		}
-		xecp_dw = next; // next is dword offset (0 means end)
+		xecp_dw = next;
 	}
 }
 
-// NEW: Intel-only routing quirk (Panther Point & friends)
 static void intel_route_all_ports(uint64_t virt_base,
 								  uint8_t start, uint8_t bus, uint8_t dev, uint8_t fn)
 {
-	// Mirror masks the BIOS allowed into the live route registers.
-	// XUSB2PRM -> XUSB2PR
 	uint32_t xusb2prm = pci_cfg_read32(virt_base, start, bus, dev, fn, 0xD4);
 	pci_cfg_write32(virt_base, start, bus, dev, fn, 0xD0, xusb2prm);
 
-	// Enable SuperSpeed termination
 	uint32_t usb3_pssen = pci_cfg_read32(virt_base, start, bus, dev, fn, 0xD8);
 	pci_cfg_write32(virt_base, start, bus, dev, fn, 0xD8, usb3_pssen);
 
-	// USB3 routing: USB3PRM -> USB3PR (older docs call it XUSB3PRM)
 	uint32_t usb3prm = pci_cfg_read32(virt_base, start, bus, dev, fn, 0xDC);
 	pci_cfg_write32(virt_base, start, bus, dev, fn, 0xDC, usb3prm);
 }
@@ -612,7 +593,6 @@ static void intel_route_all_ports(uint64_t virt_base,
 static inline uint64_t align_down(uint64_t x, uint64_t a){ return x & ~(a-1); }
 static inline uint64_t align_up  (uint64_t x, uint64_t a){ return (x + a - 1) & ~(a-1); }
 
-// Write a single 2MiB PD entry (HUGE)
 static void map_2m(uint64_t va, uint64_t pa, uint64_t flags) {
 	volatile uint64_t *pml4 = (volatile uint64_t *)(HHDM + (read_cr3() & PTE_ADDR_MASK));
 	volatile uint64_t *pdpt = descend(pml4, PML4_INDEX(va), 4);
@@ -622,13 +602,11 @@ static void map_2m(uint64_t va, uint64_t pa, uint64_t flags) {
 }
 
 static void map_range_huge(uint64_t va, uint64_t pa, uint64_t len, uint64_t flags) {
-	// 2MiB chunks
 	while (len >= (1ull<<21) &&
 		   ((va | pa) & ((1ull<<21)-1)) == 0) {
 		map_2m(va, pa, flags);
 		va += (1ull<<21); pa += (1ull<<21); len -= (1ull<<21);
 	}
-	// 4KiB tail
 	while (len) {
 		map_page(va, pa, flags);
 		va += 0x1000; pa += 0x1000; len -= 0x1000;
@@ -636,49 +614,54 @@ static void map_range_huge(uint64_t va, uint64_t pa, uint64_t len, uint64_t flag
 }
 
 static void map_hhdm_usable(uint64_t flags) {
-//	map_range_huge(HHDM, 0, max_hhdm_size, flags);
-	auto mm = memmap_req.response;
-	for (uint64_t i = 0; i < mm->entry_count; i++) {
-		auto *e = mm->entries[i];
-		if (e->type != LIMINE_MEMMAP_USABLE) continue;
-		uint64_t pa0 = align_down(e->base,        0x200000);
-		uint64_t pa1 = align_up  (e->base+e->length, 0x200000);
-		if (pa1 > pa0) map_range_huge(HHDM + pa0, pa0, pa1 - pa0, flags);
-	}
+	map_range_huge(HHDM, 0, max_hhdm_size, flags);
 }
 
+// USB Setup packet
+struct USBSetupPacket {
+	uint8_t bmRequestType;
+	uint8_t bRequest;
+	uint16_t wValue;
+	uint16_t wIndex;
+	uint16_t wLength;
+} __attribute__((packed));
+
+// Device state
+struct USBDevice {
+	uint8_t slot_id;
+	uint8_t port_num;
+	uint32_t speed;
+	struct Ring ep0_ring;
+	struct Ring kbd_ring;
+	volatile uint64_t* device_ctx;
+};
+
 extern "C" void kmain(void) {
-	// frame buffer
 	if (!LIMINE_BASE_REVISION_SUPPORTED) hcf();
 	if (!fb_req.response || fb_req.response->framebuffer_count < 1) hcf();
 	
 	fb = fb_req.response->framebuffers[0];
 	
 	if (!memmap_req.response) {
-		print("Error: No memmap response");
+		print((char*)"Error: No memmap response");
 		hcf();
 	}
 	
 	if (!hhdm_req.response) {
-		print("Error: No hhdm response");
+		print((char*)"Error: No hhdm response");
 		hcf();
 	}
 	
 	HHDM = hhdm_req.response->offset;
-	// HHDM + PA = VA
 	
-	
-	// Let's go map the memmory
-	print("Setting up memory management");
+	print((char*)"Setting up memory management");
 	init_physical_allocator();
 	map_hhdm_usable(PRESENT | WRITABLE);
 	
-	print("Mapped the entire ram");
+	print((char*)"Mapped the entire ram");
 	
-	// RSDP table (will point to the thing needed to find PCIe)
 	if (!rsdp_req.response) hcf();
 	uint64_t rsdp_va = (uint64_t)rsdp_req.response->address;
-	
 	
 	volatile uint8_t *ptr = (volatile uint8_t*)rsdp_va;
 	
@@ -692,22 +675,15 @@ extern "C" void kmain(void) {
 	}
 	
 	if (!valid_signature) {
-		print("Error: No valid signature for RSD ptr");
+		print((char*)"Error: No valid signature for RSD ptr");
 		hcf();
 	}
 	
-	// so that was the first 8 bytes of info.
-	// Next there's 1 byte for checksum, 6 for oem, 1 for revision, 4 for rsdt_address
-	
-//	uint8_t revision = ptr[8+1+6+1 - 1];
-	
-	// Read the 32-bit RSDT address
 	uint32_t rsdt_pa_32 =
 		(uint32_t)ptr[0x10] |
 		((uint32_t)ptr[0x11] << 8) |
 		((uint32_t)ptr[0x12] << 16) |
 		((uint32_t)ptr[0x13] << 24);
-	
 	
 	uint64_t rsdt_va = HHDM+(uint64_t)rsdt_pa_32;
 	volatile uint8_t *ptr_rsdt = (volatile uint8_t *)rsdt_va;
@@ -721,7 +697,7 @@ extern "C" void kmain(void) {
 		}
 	}
 	if (!valid_signature) {
-		print("Error: No valid signature for rsdt");
+		print((char*)"Error: No valid signature for rsdt");
 		hcf();
 	}
 	
@@ -731,8 +707,6 @@ extern "C" void kmain(void) {
 		((uint32_t)ptr_rsdt[6] << 16) |
 		((uint32_t)ptr_rsdt[7] << 24);
 	uint32_t entry_count = (rsdt_length - 36) / 4;
-	
-	// now that we have the rsdt, we need to skip 36 bytes, and that leads us to a list of 32 byte physical addresses. So, we'll itterate until we find 'MCFG' and that's our target (for pcie -> usb -> keyboard -> flexing on kai)
 	
 	volatile uint8_t *ptr_mcfg = 0;
 	
@@ -762,15 +736,14 @@ extern "C" void kmain(void) {
 	}
 	
 	if (ptr_mcfg == 0) {
-		print("Error: ptr_mcfg == 0");
+		print((char*)"Error: ptr_mcfg == 0");
 		hcf();
 	}
-	
 	
 	volatile struct MCFGHeader *mcfg = (volatile struct MCFGHeader *)ptr_mcfg;
 	
 	uint32_t length = mcfg->header.length;
-	uint32_t entries = (length - sizeof(struct ACPISDTHeader) - 8) / 16;  // 16 bytes per entry
+	uint32_t entries = (length - sizeof(struct ACPISDTHeader) - 8) / 16;
 	
 	uint64_t usb_virt_base;
 	uint8_t usb_start;
@@ -788,19 +761,18 @@ extern "C" void kmain(void) {
 		uint8_t start = e->start_bus;
 		uint8_t end   = e->end_bus;
 		
-		print("Mapping ECAM");
+		print((char*)"Mapping ECAM");
 		
-		uint64_t ecam_size = (uint64_t)(end - start + 1) * 0x100000ULL; // 1MiB per bus
+		uint64_t ecam_size = (uint64_t)(end - start + 1) * 0x100000ULL;
 		uint64_t virt_base = PCI_ECAM_VA_BASE + (uint64_t)seg * PCI_ECAM_SEG_STRIDE;
-		// Map MMIO as UC:
 		map_ecam_region(phys_base, virt_base, ecam_size);
-		print("Mapped...");
+		print((char*)"Mapped...");
 		
 		for (uint8_t bus = start; bus <= end; bus++) {
 			for (uint8_t dev = 0; dev < 32; dev++) {
 				for (uint8_t fn = 0; fn < 8; fn++) {
 					uint32_t id = pci_cfg_read32(virt_base, start, bus, dev, fn, 0x00);
-					if (id == 0xFFFFFFFF) continue; // no device present
+					if (id == 0xFFFFFFFF) continue;
 					
 					uint32_t class_reg = pci_cfg_read32(virt_base, start, bus, dev, fn, 0x08);
 					
@@ -809,7 +781,6 @@ extern "C" void kmain(void) {
 					uint8_t prog_if   = (class_reg >> 8) & 0xFF;
 					
 					if (baseclass == 0x0C && subclass == 0x03) {
-						// USB controller detected!
 						usb_virt_base = virt_base;
 						usb_start = start;
 						usb_bus = bus;
@@ -817,10 +788,8 @@ extern "C" void kmain(void) {
 						usb_fn = fn;
 						usb_prog_if = prog_if;
 						usb_found = true;
-						print("Found a USB controller!");
+						print((char*)"Found a USB controller!");
 						break;
-						// You can optionally differentiate:
-						// if (prog_if == 0x30) -> XHCI
 					}
 				}
 				if (usb_found) { break; }
@@ -830,46 +799,41 @@ extern "C" void kmain(void) {
 		if (usb_found) { break; }
 	}
 	
+	print((char*)"Got out of the stupid loop.");
+	
 	if (!usb_found) {
-		print("Could not find a USB controller!");
+		print((char*)"Could not find a USB controller!");
 		hcf();
 	}
 	
+	print((char*)"allocing str");
 	char* str = (char*)alloc_table();
+	print((char*)"convert to hex");
 	to_str(usb_prog_if, str);
-	print("Prog_If:");
+	print((char*)"Prog_If:");
 	print(str);
 	
 	if (usb_prog_if != 0x30) {
-		print("Unsupported USB protocol.");
+		print((char*)"Unsupported USB protocol.");
 		hcf();
 	}
 	
-	// Read vendor/device id to decide whether to apply Intel routing
 	uint32_t vid_did = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x00);
 	uint16_t vendor  = (uint16_t)(vid_did & 0xFFFF);
 	
-	// Enable Memory Space + **Bus Mastering** (needed for DMA)
 	uint16_t pcmd = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
-	pcmd |= (1u<<1) | (1u<<2); // MSE | BME
+	pcmd |= (1u<<1) | (1u<<2);
 	pci_cfg_write16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04, pcmd);
 	
-	// Intel quirk: route ports the BIOS allows to xHCI
 	if (vendor == 0x8086) {
 		print((char*)"Applying Intel xHCI routing...");
 		intel_route_all_ports(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn);
 	}
 	
-	// now that we have the usb device here, we need to identify the location of the bar addresses.
-	// essentially a bar is a register holding the loaction that will store the space in which we will communicate with the device.
-	// usb uses 1, so does nvme ssd. However, network might use more than one, vga/gpu will use several. Right now let's focus only on usb
-	
 	uint32_t bar0 = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10);
 
-	// Check BAR type first!
 	if ((bar0 & 0x1) == 1) {
-		// This is an I/O space BAR - wrong!
-		print("IO space bar err");
+		print((char*)"IO space bar err");
 		hcf();
 	}
 	
@@ -877,23 +841,19 @@ extern "C" void kmain(void) {
 	uint64_t bar_addr;
 	
 	if (bar_type == 0x2) {
-		// 64-bit BAR - your code is correct
 		uint32_t bar1_high = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x14);
 		bar_addr = ((uint64_t)bar1_high << 32) | (bar0 & ~0xFULL);
 	} else {
-		// 32-bit BAR
 		bar_addr = bar0 & ~0xFULL;
 	}
-	
 	
 	uint16_t before = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
 	pci_cfg_write16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04, before | (1 << 1));
 	uint16_t after = pci_cfg_read16(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x04);
 	
-	// Save old value
 	pci_cfg_write32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10, 0xFFFFFFFF);
 	uint32_t size_mask = pci_cfg_read32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10);
-	pci_cfg_write32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10, bar0); // restore
+	pci_cfg_write32(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, 0x10, bar0);
 	
 	uint64_t mmio_size = ~(size_mask & ~0xF) + 1;
 	
@@ -904,11 +864,15 @@ extern "C" void kmain(void) {
 	
 	map_mmio_region(bar_addr, USB_VA_BASE, mmio_size);
 	
-	print("Mapped USB");
+	print((char*)"Mapped USB");
 	
 	volatile uint32_t* read = (volatile uint32_t*)USB_VA_BASE;
 	
+	print((char*)"TEST _COMMENT");
+	
 	uint32_t info = read[0];
+	
+	print((char*)"Test_3");
 	
 	to_hex(info, str); print(str);
 	to_hex((info>>16)&0xFFFF, str); print(str);
@@ -923,49 +887,41 @@ extern "C" void kmain(void) {
 	uint32_t rtsoff = read[6] & 0xFFFFFFFF;
 	uint32_t hccparams2 = read[7] & 0xFFFFFFFF;
 	
-	
 	xhci_legacy_handoff(hcc1, USB_VA_BASE);
 	
-	
-	print("XHCI found, version: ");
+	print((char*)"XHCI found, version: ");
 	to_str(ver, str);
 	print(str);
-	print("Cap len: ");
+	print((char*)"Cap len: ");
 	to_str(caplen, str);
 	print(str);
 	
 	volatile XHCIOpRegs* ops = (volatile XHCIOpRegs*)((uintptr_t)USB_VA_BASE + caplen);
 	
-	// Doorbell and Runtime bases per spec (32-bit DB registers!)
 	volatile uint32_t* doorbell32 = (volatile uint32_t*)(USB_VA_BASE + (dboff & ~0x3));
 	volatile uint8_t*  rt_base    = (volatile uint8_t*)(USB_VA_BASE + (rtsoff & ~0x1F));
 	
-	// Interrupter 0 regs at rt_base + 0x20
 	volatile uint32_t* iman   = (volatile uint32_t*)(rt_base + 0x20 + 0x00);
 	volatile uint32_t* imod   = (volatile uint32_t*)(rt_base + 0x20 + 0x04);
 	volatile uint32_t* erstsz = (volatile uint32_t*)(rt_base + 0x20 + 0x08);
 	volatile uint64_t* erstba = (volatile uint64_t*)(rt_base + 0x20 + 0x10);
 	volatile uint64_t* erdp   = (volatile uint64_t*)(rt_base + 0x20 + 0x18);
 	
-	// --- Reset sequence ---
-	while (!(ops->usbsts & 1)) { /* ensure halted */ }
-	ops->usbcmd |= (1u << 1);     // HCRST
-	while (ops->usbcmd & (1u << 1)) { /* wait reset complete */ }
-	while (ops->usbsts & (1u << 11)) { /* CNR clears */ }
+	while (!(ops->usbsts & 1)) { }
+	ops->usbcmd |= (1u << 1);
+	while (ops->usbcmd & (1u << 1)) { }
+	while (ops->usbsts & (1u << 11)) { }
 	
-	// --- Build Command Ring ---
 	struct Ring cr = {};
 	ring_init(&cr);
-	ops->crcr = (cr.phys & ~0x3FULL) | 1;      // RCS=1
+	ops->crcr = (cr.phys & ~0x3FULL) | 1;
 	
-	// --- Build Event Ring + ERST (single segment) ---
 	volatile TRB* er_virt = (volatile TRB*)alloc_table();
 	uint64_t er_phys = ((uint64_t)er_virt) - HHDM;
-	// Event ring entries start with Cycle=0; controller will write with CCS=1
 	for (int i = 0; i < 256; i++) {
 		er_virt[i].parameter = 0;
 		er_virt[i].status    = 0;
-		er_virt[i].control   = 0; // Cycle=0
+		er_virt[i].control   = 0;
 	}
 	
 	volatile ERSTEntry* erst = (volatile ERSTEntry*)alloc_table();
@@ -975,156 +931,93 @@ extern "C" void kmain(void) {
 	erst[0].ring_segment_size = 256;
 	erst[0].reserved          = 0;
 	
-	// Program Interrupter 0 ERST/ERDP
 	*erstsz = 1;
 	*erstba = erst_phys;
-	*erdp   = er_phys; // dequeue pointer at start
+	*erdp   = er_phys;
 	
-	// Enable interrupter (optional for polling, but correct bit)
-	*iman |= (1u << 1); // IE=1
+	*iman |= (1u << 1) | (1u << 0);  // Enable interrupts: IE bit and IP bit
 	
-	// --- DCBAA & CONFIG, including Scratchpad if required ---
+	print((char*)"Event ring configured, IMAN:");
+	to_hex(*iman, str);
+	print(str);
+	
 	uint32_t max_slots = hcs1 & 0xFF;
 	
-	volatile uint64_t* dcbaa_virt = (volatile uint64_t*)alloc_table(); // 4K page
+	volatile uint64_t* dcbaa_virt = (volatile uint64_t*)alloc_table();
 	uint64_t dcbaa_phys = ((uint64_t)dcbaa_virt) - HHDM;
 	for (uint32_t i = 0; i < max_slots; i++) { dcbaa_virt[i] = 0; }
 	
-	// Scratchpad requirement from HCSPARAMS2:
-	// total_scratch = (MaxScratchpadHi << 5) | MaxScratchpadLo
-//	uint32_t hcs2 = /* your code should have read this earlier */ (uint32_t)hcs2;
-	uint32_t sp_lo = (hcs2 & 0x1F);             // bits 4:0
-	uint32_t sp_hi = (hcs2 >> 27) & 0x1F;       // bits 31:27
+	uint32_t sp_lo = (hcs2 & 0x1F);
+	uint32_t sp_hi = (hcs2 >> 27) & 0x1F;
 	uint32_t sp_count = (sp_hi << 5) | sp_lo;
 	
 	if (sp_count) {
-		// Allocate Scratchpad Buffer Array (list of physical addrs to pages)
 		volatile uint64_t* sp_array_virt = (volatile uint64_t*)alloc_table();
 		uint64_t sp_array_phys = ((uint64_t)sp_array_virt) - HHDM;
 	
 		for (uint32_t i = 0; i < sp_count; i++) {
-			// one 4KiB scratch page each (could be larger page sizes if supported)
 			volatile uint8_t* page = (volatile uint8_t*)alloc_table();
 			uint64_t page_phys = ((uint64_t)page) - HHDM;
 			sp_array_virt[i] = page_phys;
 		}
-		// DCBAA[0] must point to Scratchpad Buffer Array when present
 		dcbaa_virt[0] = sp_array_phys;
 	}
 	
 	ops->dcbaap = dcbaa_phys;
 	ops->config = max_slots;
 	
-	// --- Run the controller ---
-	ops->usbcmd |= 1u;                 // Run/Stop = 1
-	while (ops->usbsts & 1u) { /* wait HCHalted==0 */ }
+	ops->usbcmd |= 1u;
+	while (ops->usbsts & 1u) { }
 	
-	// Re-write CRCR after run (harmless; keeps you consistent with some drivers)
 	ops->crcr = (cr.phys & ~0x3FULL) | 1;
 	
-	print("Controller running!");
+	print((char*)"Controller running!");
 	
-	// --- Port loop & Enable Slot command ---
-	// --- Port loop & Enable Slot command (FIXED) ---
 	uint8_t max_ports = (hcs1 >> 24) & 0xFF;
-	uint8_t ccs = 1; // Consumer Cycle State for event ring
+	uint8_t ccs = 1;
 	uint8_t erdp_index = 0;
 	
-	// Check if Port Power Control is needed
 	bool needs_ppc = (hcc1 & (1u << 3));
 	
 	if (needs_ppc) {
-		print("We will be powering ports manually.");
+		print((char*)"We will be powering ports manually.");
 	}
 	
+	print((char*)"Scanning ports...");
 	
-	print("Waiting for device connections...");
-	size_t timeout = 5000000;  // Wait up to ~5 seconds
-	while (timeout-- > 0) {
-		TRB* evt = (TRB*)&er_virt[erdp_index];
-		uint32_t ctrl = evt->control;
-		uint32_t cyc = ctrl & 1u;
-		
-		if (cyc == ccs) {
-			uint32_t type = (ctrl >> 10) & 0x3F;
-			
-			if (type == 34) {
-				// Handle PSC event
-				uint32_t port_id = (evt->parameter >> 24) & 0xFF;
-				print("Port Status Change on port ");
-				to_str(port_id, str); print(str);
-				
-				volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)ops + 0x400 + (port_id-1) * 0x10);
-				uint32_t psc = *portsc;
-				
-				// Check if device connected
-				if (psc & 1u) {  // CCS bit
-					print("Device NOW connected!");
-					// Clear CSC bit
-					*portsc |= (1u << 17);
-					// Re-run your port enumeration logic here
-				}
-			} else {
-				print("Event type: ");
-				to_str(type, str);
-				print(str);
-			}
-			
-			// **CRITICAL: Advance ERDP after consuming ANY event**
-			erdp_index = (erdp_index + 1) % 256;
-			if (erdp_index == 0) ccs ^= 1;  // Toggle cycle state when wrapping
-			
-			uint64_t new_erdp = er_phys + (erdp_index * 16);
-			*erdp = new_erdp | (1ull << 3);  // Write new ERDP with EHB bit
-		}
-		
-		for (volatile int i = 0; i < 1000; i++);
-	}
-	
-	print("Scanning ports...");
-	
-	// PORTSC helpers
 	constexpr uint32_t PORTSC_CCS = 1u << 0;
 	constexpr uint32_t PORTSC_PED = 1u << 1;
 	constexpr uint32_t PORTSC_PR  = 1u << 4;
-	constexpr uint32_t PORTSC_PLS_MASK = 0xFu << 5;   // bits 5..8
+	constexpr uint32_t PORTSC_PLS_MASK = 0xFu << 5;
 	constexpr uint32_t PORTSC_PP  = 1u << 9;
-	constexpr uint32_t PORTSC_PS_MASK  = 0xFu << 10;  // bits 10..13
-	constexpr uint32_t PORTSC_PIC_MASK = 0x3u << 14;  // bits 14..15
+	constexpr uint32_t PORTSC_PS_MASK  = 0xFu << 10;
+	constexpr uint32_t PORTSC_PIC_MASK = 0x3u << 14;
 	constexpr uint32_t PORTSC_LWS = 1u << 16;
 	constexpr uint32_t PORTSC_W1C = (1u<<17)|(1u<<18)|(1u<<19)|(1u<<20)|
-									(1u<<21)|(1u<<22)|(1u<<23); // CSC..CEC
+									(1u<<21)|(1u<<22)|(1u<<23);
 	
-	// Clear any *set* change bits (W1C), preserving everything else:
 	auto ack_port_changes = [&](volatile uint32_t* portsc) {
 		uint32_t v = *portsc;
-		uint32_t w = (v & ~PORTSC_W1C) | (v & PORTSC_W1C); // write 1s only where bits are set
+		uint32_t w = (v & ~PORTSC_W1C) | (v & PORTSC_W1C);
 		*portsc = w;
 	};
 	
-	// Issue port reset *without* dropping PP/PLS/PS/PIC:
 	auto port_reset = [&](volatile uint32_t* portsc) -> bool {
 		uint32_t v = *portsc;
-	
-		// If you have PPC, make sure PP is on before anything else.
 		v |= PORTSC_PP;
-	
-		// Do not accidentally clear W1C bits when setting PR.
 		uint32_t w = (v & ~PORTSC_W1C) | PORTSC_PR;
 		*portsc = w;
-	
-		// Wait for PR to clear (reset complete)
 		int timeout = 100000;
 		while ((*portsc & PORTSC_PR) && --timeout) { __asm__ __volatile__("pause"); }
 		if (!timeout) return false;
-	
-		// After PR clears, the xHC should set PED=1 and PRC=1. Ack PRC.
 		uint32_t v2 = *portsc;
-		uint32_t w2 = (v2 & ~PORTSC_W1C) | (1u<<21); // PRC W1C
+		uint32_t w2 = (v2 & ~PORTSC_W1C) | (1u<<21);
 		*portsc = w2;
 		return true;
 	};
 	
+	USBDevice kbd_device = {};
+	bool device_found = false;
 	
 	for (uint32_t i = 0; i < max_ports; i++) {
 		volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)ops + 0x400 + i * 0x10);
@@ -1139,24 +1032,28 @@ extern "C" void kmain(void) {
 		uint32_t v = *portsc;
 		if (!(v & PORTSC_CCS)) continue;
 		
+		print((char*)"Device on port ");
+		to_str(i+1, str);
+		print(str);
+		
 		if (!port_reset(portsc)) {
 			print((char*)"Port reset timeout");
 			continue;
 		}
 		
 		uint32_t v_after = *portsc;
-		if (!(v_after & PORTSC_CCS)) {
-			print((char*)"Port not enabled after reset; PORTSC:");
-			to_hex(v_after, str); print(str);
+		if (!(v_after & PORTSC_PED)) {
+			print((char*)"Port not enabled after reset");
 			continue;
 		}
 		
+		// Enable Slot
 		ring_push_cmd(&cr, (9u<<10), 0, 0);
 		doorbell32[0] = 0;
 		
-		timeout = 1000000;
+		size_t timeout = 1000000;
 		bool got_response = false;
-		uint32_t slot_id;
+		uint32_t slot_id = 0;
 		
 		while (timeout-- > 0) {
 			TRB* evt = (TRB*)&er_virt[erdp_index];
@@ -1164,115 +1061,605 @@ extern "C" void kmain(void) {
 			uint32_t cyc = ctrl & 1u;
 			
 			if (cyc != ccs) {
-				// Event not ready yet
-				for (volatile int i = 0; i < 10; i++);
+				for (volatile int j = 0; j < 10; j++);
 				continue;
 			}
 			
 			uint32_t type = (ctrl >> 10) & 0x3F;
-			print("Event type:");
-			to_str(type, str);
-			print(str);
 			
 			if (type == 34) {
-				print("Port Status Change Event");
-				
 				erdp_index = (erdp_index + 1) % 256;
 				if (erdp_index == 0) ccs ^= 1;
-				
 				uint64_t new_erdp = er_phys + (erdp_index * 16);
 				*erdp = new_erdp | (1ull << 3);
 				continue;
-			}else if (type == 33) {
+			} else if (type == 33) {
 				uint32_t code = (evt->status >> 24) & 0xFF;
-				print("Completion code:");
-				to_str(code, str); 
-				print(str);
 				
-				if (code == 1) {  // Success
+				if (code == 1) {
 					slot_id = (ctrl >> 24) & 0xFF;
-					print("Slot enabled! ID="); 
+					print((char*)"Slot enabled! ID="); 
 					to_str(slot_id, str); 
 					print(str);
 				} else {
-					print("Enable Slot FAILED with code:");
-					to_str(code, str);
+					print((char*)"Enable Slot FAILED");
+				}
+				
+				erdp_index = (erdp_index + 1) % 256;
+				if (erdp_index == 0) ccs ^= 1;
+				uint64_t new_erdp = er_phys + (erdp_index * 16);
+				*erdp = new_erdp | (1ull << 3);
+				got_response = true;
+				break;
+			} else {
+				erdp_index = (erdp_index + 1) % 256;
+				if (erdp_index == 0) ccs ^= 1;
+				uint64_t new_erdp = er_phys + (erdp_index * 16);
+				*erdp = new_erdp | (1ull << 3);
+			}
+		}
+		
+		if (!got_response || slot_id == 0) {
+			print((char*)"Timeout waiting for Enable Slot");
+			continue;
+		}
+		
+		// Setup device context
+		struct Ring ep0;
+		ring_init(&ep0);
+		uint64_t ep0_ring_phys = ep0.phys;
+		
+		uint32_t speed = (v_after >> 10) & 0xF;
+		
+		// Allocate device output context and add to DCBAA FIRST
+		volatile uint64_t* dev_ctx = alloc_table();
+		uint64_t dev_ctx_phys = (uint64_t)dev_ctx - HHDM;
+		dcbaa_virt[slot_id] = dev_ctx_phys;
+		
+		volatile uint64_t* input_ctx_virt = alloc_table();
+		uint64_t input_ctx_phys = (uint64_t)input_ctx_virt - HHDM;
+		
+		// Clear entire input context
+		for (int j = 0; j < 512; j++) {
+			input_ctx_virt[j] = 0;
+		}
+		
+		volatile InputControlCtx *icc = (volatile InputControlCtx*)input_ctx_virt;
+		icc->add_flags = (1 << 0) | (1 << 1);  // Add slot + EP0
+		icc->drop_flags = 0;
+		
+		// Slot context is at offset 0x20 (32 bytes = 4 u64s)
+		volatile uint32_t* slot_ctx_dw = (volatile uint32_t*)(input_ctx_virt + 4);
+		
+		// DW0: route string + speed + context entries
+		slot_ctx_dw[0] = 0 | ((speed & 0xF) << 20) | ((1 & 0x1F) << 27);  // 1 context entry (EP0)
+		// DW1: max exit latency + root hub port + num ports
+		slot_ctx_dw[1] = 0 | ((i + 1) << 16);  // Root hub port number
+		// DW2-7: zeros for now
+		
+		// EP0 context at offset 0x40 (64 bytes = 8 u64s)
+		volatile uint32_t* ep0_ctx_dw = (volatile uint32_t*)(input_ctx_virt + 8);
+		
+		#define EP_TYPE_CONTROL 4
+		
+		uint16_t max_packet = (speed == 4) ? 64 : 8;  // High speed = 64, else 8
+		
+		// DW0: EP state
+		ep0_ctx_dw[0] = 0;
+		// DW1: EP type + max packet size + max burst + error count
+		ep0_ctx_dw[1] = (EP_TYPE_CONTROL << 3) | (max_packet << 16) | (3 << 1);  // CErr = 3
+		// DW2-3: TR Dequeue Pointer with DCS=1
+		ep0_ctx_dw[2] = (uint32_t)(ep0_ring_phys | 1);
+		ep0_ctx_dw[3] = (uint32_t)(ep0_ring_phys >> 32);
+		// DW4: Average TRB Length
+		ep0_ctx_dw[4] = 8;
+		
+		// Address Device
+		ring_push_cmd(&cr, (11u << 10) | (slot_id << 24), 
+		              (uint32_t)(input_ctx_phys & 0xFFFFFFFF),
+		              (uint32_t)(input_ctx_phys >> 32));
+		doorbell32[0] = 0;
+		
+		timeout = 1000000;
+		got_response = false;
+		
+		while (timeout-- > 0) {
+			TRB* evt = (TRB*)&er_virt[erdp_index];
+			uint32_t ctrl = evt->control;
+			uint32_t cyc = ctrl & 1u;
+			
+			if (cyc != ccs) {
+				for (volatile int j = 0; j < 10; j++);
+				continue;
+			}
+			
+			uint32_t type = (ctrl >> 10) & 0x3F;
+			
+			if (type == 33) {
+				uint32_t code = (evt->status >> 24) & 0xFF;
+				
+				print((char*)"Address completion code: ");
+				to_str(code, str);
+				print(str);
+				
+				if (code == 1) {
+					print((char*)"Device addressed!");
+				} else {
+					print((char*)"Address Device FAILED");
+					to_hex(evt->parameter, str);
 					print(str);
 				}
 				
-				// Advance ERDP
 				erdp_index = (erdp_index + 1) % 256;
 				if (erdp_index == 0) ccs ^= 1;
-				
 				uint64_t new_erdp = er_phys + (erdp_index * 16);
 				*erdp = new_erdp | (1ull << 3);
-				
 				got_response = true;
 				break;
-			}else {
-				print("Unexpected event type");
-				
+			} else {
 				erdp_index = (erdp_index + 1) % 256;
 				if (erdp_index == 0) ccs ^= 1;
-				
 				uint64_t new_erdp = er_phys + (erdp_index * 16);
 				*erdp = new_erdp | (1ull << 3);
 			}
 		}
 		
 		if (!got_response) {
-			print("Timeout waiting for Enable Slot response");
+			print((char*)"Timeout waiting for Address Device");
 			continue;
 		}
 		
+		spin_delay(10000);  // Give device time to settle
 		
+		// Set Boot Protocol (HID-specific)
+		volatile uint8_t* setup_buf = (volatile uint8_t*)alloc_table();
+		uint64_t setup_phys = (uint64_t)setup_buf - HHDM;
 		
+		USBSetupPacket* setup = (USBSetupPacket*)setup_buf;
+		setup->bmRequestType = 0x21;  // Host to Device, Class, Interface
+		setup->bRequest = 0x0B;       // SET_PROTOCOL
+		setup->wValue = 0;            // Boot protocol
+		setup->wIndex = 0;            // Interface 0
+		setup->wLength = 0;
 		
+		// Build control transfer on EP0
+		// Setup Stage TRB: TRT=0 (no data), IDT=1 (immediate data in parameter)
+		uint64_t setup_dw0 = ((uint64_t)setup->bmRequestType) | 
+		                     ((uint64_t)setup->bRequest << 8) |
+		                     ((uint64_t)setup->wValue << 16) |
+		                     ((uint64_t)setup->wIndex << 32) |
+		                     ((uint64_t)setup->wLength << 48);
 		
-		// here we have the item that seems to be ready?
+		ring_push_cmd(&ep0, (2u << 10) | (8 << 16) | (1 << 6), setup_dw0, 0);  // Setup Stage, IDT=1
 		
-		struct Ring ep0;
-		ring_init(&ep0);
-		uint64_t ep0_ring_phys = ep0.phys;
+		// Status Stage TRB (IN direction, IOC=1)
+		ring_push_cmd(&ep0, (4u << 10) | (1 << 16) | (1 << 5), 0, 0);  // Status IN, IOC
 		
+		doorbell32[slot_id] = 1;  // Ring EP0
 		
-		uint32_t speed = (v >> 10) & 0xF;
+		timeout = 1000000;
+		got_response = false;
 		
-		volatile uint64_t* input_ctx_virt = alloc_table();
-		uint32_t input_ctx_phys = (uint64_t)input_ctx_virt-HHDM;
+		while (timeout-- > 0) {
+			TRB* evt = (TRB*)&er_virt[erdp_index];
+			uint32_t ctrl = evt->control;
+			uint32_t cyc = ctrl & 1u;
+			
+			if (cyc != ccs) {
+				for (volatile int j = 0; j < 10; j++);
+				continue;
+			}
+			
+			uint32_t type = (ctrl >> 10) & 0x3F;
+			
+			if (type == 32 || type == 33) {  // Transfer or Command completion
+				erdp_index = (erdp_index + 1) % 256;
+				if (erdp_index == 0) ccs ^= 1;
+				uint64_t new_erdp = er_phys + (erdp_index * 16);
+				*erdp = new_erdp | (1ull << 3);
+				got_response = true;
+				break;
+			} else {
+				erdp_index = (erdp_index + 1) % 256;
+				if (erdp_index == 0) ccs ^= 1;
+				uint64_t new_erdp = er_phys + (erdp_index * 16);
+				*erdp = new_erdp | (1ull << 3);
+			}
+		}
 		
+		print((char*)"Boot protocol set");
 		
-		volatile InputControlCtx *data = (volatile InputControlCtx*)input_ctx_virt;
-		data->add_flags = (1 << 0) | (1 << 1);
+		spin_delay(10000);
 		
-		volatile SlotCtx* slot_ctx = (volatile SlotCtx*)(input_ctx_virt+0x20);
+		// Configure Endpoint for keyboard interrupt IN
+		// EP1 IN = DCI 3 (formula: DCI = EP_NUM * 2 + direction, where direction is 1 for IN)
 		
-		slot_ctx->route_string = 0;
-		slot_ctx->speed = speed; // e.g. 3 = full speed, 4 = high speed, etc.
-		slot_ctx->port_num = i + 1;  // 1-based per xHCI spec
+		print((char*)"Initializing kbd_ring...");
+		ring_init(&kbd_device.kbd_ring);
+		print((char*)"kbd_ring initialized");
+		to_hex(kbd_device.kbd_ring.phys, str);
+		print(str);
 		
-		volatile struct EndpointCtx *ep0_ctx = (volatile struct EndpointCtx *)((uintptr_t)input_ctx_virt + 0x40);
+		volatile uint64_t* input_ctx2 = alloc_table();
+		uint64_t input_ctx2_phys = (uint64_t)input_ctx2 - HHDM;
 		
-		#define EP_TYPE_CONTROL 4
+		// Clear entire context
+		for (int j = 0; j < 512; j++) {
+			input_ctx2[j] = 0;
+		}
 		
-		ep0_ctx->ep_state = 0;
-		ep0_ctx->ep_flags =
-			(EP_TYPE_CONTROL << 3) |      // Endpoint Type (Control)
-			(64 << 16);                   // Max Packet Size (HS)
-		ep0_ctx->tr_deq_ptr = ep0_ring_phys | 1; // bit 0 = DCS
-		ep0_ctx->avg_trb_len = 8;
-		ep0_ctx->max_esit_hi = 0;
+		volatile InputControlCtx *icc2 = (volatile InputControlCtx*)input_ctx2;
+		icc2->add_flags = (1 << 0) | (1 << 3);  // Add slot context (bit 0) + EP1 IN (DCI=3, bit 3)
+		icc2->drop_flags = 0;
 		
-		ring_push_cmd(&cr, (11u << 10) | (slot_id << 24), 
-		              (uint32_t)(input_ctx_phys & 0xFFFFFFFF),
-		              (uint32_t)(input_ctx_phys >> 32));
+		// Copy slot context from device output context
+		volatile uint32_t* dev_slot_ctx = (volatile uint32_t*)dev_ctx;
+		volatile uint32_t* slot_ctx2_dw = (volatile uint32_t*)(input_ctx2 + 4);
+		
+		// Copy existing slot context and update context entries to 3
+		for (int j = 0; j < 8; j++) {
+			slot_ctx2_dw[j] = dev_slot_ctx[j];
+		}
+		// Update context entries field to 3 (slot + EP0 + EP1)
+		slot_ctx2_dw[0] = (slot_ctx2_dw[0] & ~(0x1F << 27)) | ((3 & 0x1F) << 27);
+		
+		// Copy EP0 context from device output context
+		volatile uint32_t* dev_ep0_ctx = (volatile uint32_t*)(dev_ctx + 4);
+		volatile uint32_t* ep0_ctx2_dw = (volatile uint32_t*)(input_ctx2 + 8);
+		for (int j = 0; j < 8; j++) {
+			ep0_ctx2_dw[j] = dev_ep0_ctx[j];
+		}
+		
+		// Skip EP1 OUT (would be at input_ctx2 + 12)
+		
+		// EP1 IN context at DCI=3, which is context index 3
+		// Offset: 0x20 (input control) + 3 * 0x20 = 0x80 bytes = 16 u64s
+		volatile uint32_t* ep1_ctx_dw = (volatile uint32_t*)(input_ctx2 + 16);
+		
+		// Calculate interval for full/low speed
+		// For keyboards, typically bInterval=10ms
+		// Interval encoding: for Full/Low speed, it's the exponent (2^n frames)
+		uint8_t interval;
+		if (speed == 3 || speed == 2) {  // Full speed or Low speed
+			interval = 3;  // 2^3 = 8 frames ≈ 8ms
+		} else {
+			interval = 4;  // For high speed, use microframes
+		}
+		
+		// Calculate MaxPStreams (should be 0 for interrupt endpoints)
+		uint32_t max_pstreams = 0;
+		
+		// DW0: EP state + interval + max primary streams
+		ep1_ctx_dw[0] = (interval << 16) | (max_pstreams << 10);
+		
+		// DW1: EP type=7 (Interrupt IN) + CErr=3 + MaxPacketSize=8 + MaxBurstSize=0
+		// CErr at bits 1-2, EP Type at bits 3-5, MaxBurstSize at bits 8-15, MaxPacketSize at bits 16-31
+		ep1_ctx_dw[1] = (3 << 1) | (7 << 3) | (0 << 8) | (8 << 16);
+		
+		// DW2-3: TR Dequeue Pointer with DCS=1
+		// Must be 16-byte aligned
+		ep1_ctx_dw[2] = (uint32_t)(kbd_device.kbd_ring.phys | 1);
+		ep1_ctx_dw[3] = (uint32_t)(kbd_device.kbd_ring.phys >> 32);
+		
+		// DW4: Average TRB Length
+		ep1_ctx_dw[4] = 8;
+		
+		// DW5-7: Reserved
+		ep1_ctx_dw[5] = 0;
+		ep1_ctx_dw[6] = 0;
+		ep1_ctx_dw[7] = 0;
+		
+		// Configure Endpoint command
+		ring_push_cmd(&cr, (12u << 10) | (slot_id << 24), 
+		              (uint32_t)(input_ctx2_phys & 0xFFFFFFFF),
+		              (uint32_t)(input_ctx2_phys >> 32));
 		doorbell32[0] = 0;
 		
+		timeout = 1000000;
+		got_response = false;
 		
+		while (timeout-- > 0) {
+			TRB* evt = (TRB*)&er_virt[erdp_index];
+			uint32_t ctrl = evt->control;
+			uint32_t cyc = ctrl & 1u;
+			
+			if (cyc != ccs) {
+				for (volatile int j = 0; j < 10; j++);
+				continue;
+			}
+			
+			uint32_t type = (ctrl >> 10) & 0x3F;
+			
+			if (type == 33) {
+				uint32_t code = (evt->status >> 24) & 0xFF;
+				
+				print((char*)"Configure EP code: ");
+				to_str(code, str);
+				print(str);
+				
+				if (code == 1) {
+					print((char*)"Endpoint configured!");
+				} else {
+					print((char*)"Configure Endpoint FAILED");
+					print((char*)"TRB pointer:");
+					to_hex(evt->parameter, str);
+					print(str);
+					print((char*)"Slot ID:");
+					to_str(slot_id, str);
+					print(str);
+					print((char*)"Input ctx phys:");
+					to_hex(input_ctx2_phys, str);
+					print(str);
+					print((char*)"Add flags:");
+					to_hex(icc2->add_flags, str);
+					print(str);
+					print((char*)"Drop flags:");
+					to_hex(icc2->drop_flags, str);
+					print(str);
+					print((char*)"EP1 DW0:");
+					to_hex(ep1_ctx_dw[0], str);
+					print(str);
+					print((char*)"EP1 DW1:");
+					to_hex(ep1_ctx_dw[1], str);
+					print(str);
+					print((char*)"Ring phys:");
+					to_hex(kbd_device.kbd_ring.phys, str);
+					print(str);
+				}
+				
+				erdp_index = (erdp_index + 1) % 256;
+				if (erdp_index == 0) ccs ^= 1;
+				uint64_t new_erdp = er_phys + (erdp_index * 16);
+				*erdp = new_erdp | (1ull << 3);
+				got_response = true;
+				break;
+			} else {
+				erdp_index = (erdp_index + 1) % 256;
+				if (erdp_index == 0) ccs ^= 1;
+				uint64_t new_erdp = er_phys + (erdp_index * 16);
+				*erdp = new_erdp | (1ull << 3);
+			}
+		}
+		
+		if (!got_response) {
+			print((char*)"Timeout configuring endpoint");
+			continue;
+		}
+		
+		print((char*)"Endpoint configured successfully!");
+		
+		// Queue initial transfer requests for keyboard
+		volatile uint8_t* kbd_buffer1 = (volatile uint8_t*)alloc_table();
+		volatile uint8_t* kbd_buffer2 = (volatile uint8_t*)alloc_table();
+		uint64_t kbd_buffer1_phys = (uint64_t)kbd_buffer1 - HHDM;
+		uint64_t kbd_buffer2_phys = (uint64_t)kbd_buffer2 - HHDM;
+		
+		// Clear buffers
+		for (int j = 0; j < 4096; j++) {
+			kbd_buffer1[j] = 0;
+			kbd_buffer2[j] = 0;
+		}
+		
+		print((char*)"Queueing initial transfers...");
+		to_hex(kbd_buffer1_phys, str);
+		print(str);
+		
+		print((char*)"kbd_ring enq:");
+		to_str(kbd_device.kbd_ring.enq, str);
+		print(str);
+		
+		print((char*)"kbd_ring pcs:");
+		to_str(kbd_device.kbd_ring.pcs, str);
+		print(str);
+		
+		// Queue initial transfer - Normal TRB with IOC flag
+		// TRB Type=1 (Normal), IOC=1 (bit 5), TRB Transfer Length in bits 17-31 of status field
+		volatile TRB *trb1 = &kbd_device.kbd_ring.trb[kbd_device.kbd_ring.enq];
+		
+		print((char*)"Setting TRB fields...");
+		trb1->parameter = kbd_buffer1_phys;
+		print((char*)"Set parameter");
+		trb1->status = 8;  // Transfer length = 8 bytes
+		print((char*)"Set status");
+		trb1->control = (1u << 10) | (1u << 5) | kbd_device.kbd_ring.pcs;  // Normal TRB, IOC, PCS
+		print((char*)"Set control");
+		
+		if (++kbd_device.kbd_ring.enq == 255) {
+			kbd_device.kbd_ring.enq = 0;
+			kbd_device.kbd_ring.pcs ^= 1;
+		}
+		
+		print((char*)"Transfer queued, about to ring doorbell...");
+		print((char*)"Slot ID:");
+		to_str(slot_id, str);
+		print(str);
+		print((char*)"Doorbell address:");
+		to_hex((uint64_t)&doorbell32[slot_id], str);
+		print(str);
+		
+		doorbell32[slot_id] = 3;  // Ring EP1 IN (DCI=3)
+		
+		print((char*)"Doorbell rung, continuing...");
+		
+		kbd_device.slot_id = slot_id;
+		kbd_device.port_num = i + 1;
+		kbd_device.speed = speed;
+		kbd_device.ep0_ring = ep0;
+		kbd_device.device_ctx = dev_ctx;
+		device_found = true;
+		
+		print((char*)"Keyboard initialized!");
+		print((char*)"Breaking from port scan loop...");
+		break;
 	}
 	
-	print("Port scan complete.");
+	print((char*)"Exited port scan loop");
 	
-	print("Finished.");
+	if (!device_found) {
+		print((char*)"No keyboard found!");
+		hcf();
+	}
+	
+	print((char*)"About to enter main loop");
+	
+	print((char*)"");
+	print((char*)"Press any key...");
+	print((char*)"");
+	print((char*)"Polling for events...");
+	
+	// Main keyboard polling loop
+	uint8_t last_keys[6] = {0};
+	uint32_t event_count = 0;
+	uint32_t transfer_count = 0;
+	uint64_t loop_count = 0;
+	
+	while (true) {
+		loop_count++;
+		
+		// Show we're still alive every million loops
+		if (loop_count % 10000000 == 0) {
+			print((char*)"Still polling... Events:");
+			to_str(event_count, str);
+			print(str);
+			print((char*)"ERDP index:");
+			to_str(erdp_index, str);
+			print(str);
+			print((char*)"CCS:");
+			to_str(ccs, str);
+			print(str);
+			
+			// Check current event ring entry
+			TRB* cur_evt = (TRB*)&er_virt[erdp_index];
+			print((char*)"Current TRB cycle:");
+			to_str(cur_evt->control & 1, str);
+			print(str);
+		}
+		
+		TRB* evt = (TRB*)&er_virt[erdp_index];
+		uint32_t ctrl = evt->control;
+		uint32_t cyc = ctrl & 1u;
+		
+		if (cyc != ccs) {
+			continue;
+		}
+		
+		event_count++;
+		if (event_count <= 10) {
+			print((char*)"Event received! Type:");
+			to_str((ctrl >> 10) & 0x3F, str);
+			print(str);
+		}
+		
+		uint32_t type = (ctrl >> 10) & 0x3F;
+		
+		if (type == 32) {  // Transfer Event
+			transfer_count++;
+			
+			uint32_t code = (evt->status >> 24) & 0xFF;
+			uint64_t trb_ptr = evt->parameter;
+			uint32_t transfer_len = evt->status & 0xFFFFFF;
+			
+			print((char*)"Transfer event! Code:");
+			to_str(code, str);
+			print(str);
+			print((char*)"Residual length:");
+			to_str(transfer_len, str);
+			print(str);
+			
+			if (code == 1 || code == 13) {  // Success or Short Packet
+				// Get the physical address from the TRB pointer
+				uint64_t report_phys = trb_ptr;
+				volatile uint8_t* report = (volatile uint8_t*)(HHDM + report_phys);
+				
+				// Debug: show raw report data
+				print((char*)"Report bytes:");
+				for (int b = 0; b < 8; b++) {
+					char hex_str[4];
+					uint8_t val = report[b];
+					hex_str[0] = HEX_NUMS[(val >> 4) & 0xF];
+					hex_str[1] = HEX_NUMS[val & 0xF];
+					hex_str[2] = ' ';
+					hex_str[3] = '\0';
+					print(hex_str);
+				}
+				
+				// Parse HID keyboard report
+				uint8_t modifiers = report[0];
+				bool shift = (modifiers & 0x22) != 0;
+				
+				// Check for new key presses
+				bool any_key = false;
+				for (int k = 2; k < 8; k++) {
+					uint8_t key = report[k];
+					if (key == 0) continue;
+					
+					any_key = true;
+					
+					// Check if this is a new key (not in last_keys)
+					bool is_new = true;
+					for (int j = 0; j < 6; j++) {
+						if (last_keys[j] == key) {
+							is_new = false;
+							break;
+						}
+					}
+					
+					if (is_new && key < 256) {
+						print((char*)"New key code:");
+						to_str(key, str);
+						print(str);
+						
+						char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
+						if (c != 0) {
+							print((char*)"Key pressed:");
+							char msg[2];
+							msg[0] = c;
+							msg[1] = '\0';
+							print(msg);
+						}
+					}
+				}
+				
+				// Update last_keys
+				for (int k = 0; k < 6; k++) {
+					last_keys[k] = report[k + 2];
+				}
+				
+				// Queue another transfer using the same buffer
+				volatile TRB *new_trb = &kbd_device.kbd_ring.trb[kbd_device.kbd_ring.enq];
+				new_trb->parameter = report_phys;
+				new_trb->status = 8;
+				new_trb->control = (1u << 10) | (1u << 5) | kbd_device.kbd_ring.pcs;
+				
+				if (++kbd_device.kbd_ring.enq == 255) {
+					kbd_device.kbd_ring.enq = 0;
+					kbd_device.kbd_ring.pcs ^= 1;
+				}
+				
+				doorbell32[kbd_device.slot_id] = 3;
+			} else {
+				print((char*)"Transfer error, not requeueing");
+			}
+			
+			erdp_index = (erdp_index + 1) % 256;
+			if (erdp_index == 0) ccs ^= 1;
+			uint64_t new_erdp = er_phys + (erdp_index * 16);
+			*erdp = new_erdp | (1ull << 3);
+		} else {
+			// Other event types
+			if (event_count <= 10) {
+				print((char*)"Other event type:");
+				to_str(type, str);
+				print(str);
+			}
+			
+			erdp_index = (erdp_index + 1) % 256;
+			if (erdp_index == 0) ccs ^= 1;
+			uint64_t new_erdp = er_phys + (erdp_index * 16);
+			*erdp = new_erdp | (1ull << 3);
+		}
+	}
+	
+	print((char*)"Finished.");
 	hcf();
 }
