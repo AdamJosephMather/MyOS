@@ -932,6 +932,11 @@ extern "C" void kmain(void) {
 	uint32_t rtsoff = read[6] & 0xFFFFFFFF;
 	uint32_t hccparams2 = read[7] & 0xFFFFFFFF;
 	
+	bool has_ac64 = (hcc1 & 1);
+	if (!has_ac64) {
+		print("WARNING: xHCI controller is 32-bit only!");
+	}
+	
 	xhci_legacy_handoff(hcc1, USB_VA_BASE);
 	
 	print((char*)"XHCI found, version: ");
@@ -1071,24 +1076,37 @@ extern "C" void kmain(void) {
 	constexpr uint32_t PORTSC_W1C = (1u<<17)|(1u<<18)|(1u<<19)|(1u<<20)|
 									(1u<<21)|(1u<<22)|(1u<<23);
 	
-	auto ack_port_changes = [&](volatile uint32_t* portsc) {
-		uint32_t v = *portsc;
-		uint32_t w = (v & ~PORTSC_W1C) | (v & PORTSC_W1C);
-		*portsc = w;
-	};
-	
 	auto port_reset = [&](volatile uint32_t* portsc) -> bool {
-		uint32_t v = *portsc;
-		v |= PORTSC_PP;
-		uint32_t w = (v & ~PORTSC_W1C) | PORTSC_PR;
-		*portsc = w;
-		int timeout = 100000;
-		while ((*portsc & PORTSC_PR) && --timeout) { __asm__ __volatile__("pause"); }
-		if (!timeout) return false;
-		uint32_t v2 = *portsc;
-		uint32_t w2 = (v2 & ~PORTSC_W1C) | (1u<<21);
-		*portsc = w2;
-		return true;
+		uint32_t v_1 = *portsc;
+		v_1 |= PORTSC_PR;
+		*portsc = v_1;
+		
+		USB_Response resp;
+		while (true) {
+			resp = get_usb_response();
+			if (resp.gotresponse) {
+				break;
+			}
+		}
+		
+		print((char*)"With resp.");
+		
+		if (!resp.gotresponse) {
+			print((char*)"Not available.");
+			return false;
+		}else if (resp.type != 34) {
+			print((char*)"Wrong type.");
+			return false;
+		}
+		
+		uint32_t v_2 = *portsc;
+		if (v_2 & PORTSC_PED) {
+			print((char*)"Reset port!");
+			return true;
+		}else{
+			print((char*)"Did not get port reset PED");
+			return false;
+		}
 	};
 	
 	USBDevice kbd_device = {};
@@ -1102,8 +1120,6 @@ extern "C" void kmain(void) {
 			spin_delay(50*1000);
 		}
 		
-		ack_port_changes(portsc);
-		
 		uint32_t v = *portsc;
 		if (!(v & PORTSC_CCS)) continue;
 		
@@ -1112,13 +1128,6 @@ extern "C" void kmain(void) {
 		print(str);
 		
 		if (!port_reset(portsc)) {
-			print((char*)"Port reset timeout");
-			continue;
-		}
-		
-		uint32_t v_after = *portsc;
-		if (!(v_after & PORTSC_CCS)) {
-			print((char*)"Port not enabled after reset");
 			continue;
 		}
 		
@@ -1163,7 +1172,8 @@ extern "C" void kmain(void) {
 		ring_init(&ep0);
 		uint64_t ep0_ring_phys = ep0.phys;
 		
-		uint32_t speed = (v_after >> 10) & 0xF;
+		
+		uint32_t speed = (*portsc >> 10) & 0xF;
 		
 		// Allocate device output context and add to DCBAA FIRST
 		volatile uint64_t* dev_ctx = alloc_table();
