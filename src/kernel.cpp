@@ -1302,11 +1302,11 @@ extern "C" void kmain(void) {
 		doorbell32[0] = 0;
 		
 		
-		resp = (USB_Response){false};                                                                     //  GGGG  EEEE TTTTTT    SSSS  UU    UU RRRR   FFFF  AAAAA   CCCC EEEE    KK  KK BBBB 
-		for (;;) {                                                                                        // GG     EE     TT     SSS    UU    UU RR RR  FF   AA   AA CC    EE      KK KK  BB BB
-			USB_Response tmp = get_usb_response();                                                        // GG GGG EEE    TT      SSS   UU    UU RRRR   FFFF AAAAAAA CC    EEE     KKKK   BBBB 
-			if (tmp.type == 33) { resp = tmp; break; } // Command Completion Event                        // GG  GG EE     TT        SSS UU    UU RR RR  FF   AA   AA CC    EE      KK KK  BB BB
-		}                                                                                                 //  GGGG  EEEE   TT      SSSS   UUUUUU  RR  RR FF   AA   AA  CCCC EEEE    KK  KK BBBB 
+		resp = (USB_Response){false};                                                        //      GGGG  EEEE TTTTTT     SSSS  UU    UU RRRR   FFFF  AAAAA   CCCC EEEE     KK  KK BBBB 
+		for (;;) {                                                                           //     GG     EE     TT      SSS    UU    UU RR RR  FF   AA   AA CC    EE       KK KK  BB BB
+			USB_Response tmp = get_usb_response();                                           //     GG GGG EEE    TT       SSS   UU    UU RRRR   FFFF AAAAAAA CC    EEE      KKKK   BBBB 
+			if (tmp.type == 33) { resp = tmp; break; } // Command Completion Event           //     GG  GG EE     TT         SSS UU    UU RR RR  FF   AA   AA CC    EE       KK KK  BB BB
+		}                                                                                    //      GGGG  EEEE   TT       SSSS   UUUUUU  RR  RR FF   AA   AA  CCCC EEEE     KK  KK BBBB 
 		
 		if (!resp.gotresponse) {
 			print((char*)"Did not get response to Address Device");
