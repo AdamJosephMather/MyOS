@@ -681,6 +681,35 @@ USB_Response get_usb_response(int timeout = 1000000) {
 	return {false};
 }
 
+void ep0_ctrl_no_data(uint32_t slot_id, Ring* ep0, uint8_t bmReq, uint8_t bReq, uint16_t wValue, uint16_t wIndex, volatile uint32_t* doorbell32) {
+	uint8_t* buf = (uint8_t*)alloc_table();
+	uint64_t phys = (uint64_t)buf - HHDM;
+
+	// Build Setup packet in memory (for IDT=1)
+	((USBSetupPacket*)buf)->bmRequestType = bmReq;
+	((USBSetupPacket*)buf)->bRequest      = bReq;
+	((USBSetupPacket*)buf)->wValue        = wValue;
+	((USBSetupPacket*)buf)->wIndex        = wIndex;
+	((USBSetupPacket*)buf)->wLength       = 0;
+
+	uint64_t setup_dw0 = *(uint64_t*)buf;
+
+	// Setup Stage (TRB type 2), IDT=1, no data stage → TRT=0
+	ring_push_cmd(ep0, (2u<<10) | (1<<6), setup_dw0, 8 /*length must be 8*/);
+
+	// Status Stage (TRB type 4), Direction=IN, IOC=1
+	ring_push_cmd(ep0, (4u<<10) | (1<<16) | (1<<5), 0, 0);
+
+	// Ring EP0 doorbell (DCI=1)
+	doorbell32[slot_id] = 1;
+
+	// Wait for a Transfer Event (type 32)
+	for (;;) {
+		USB_Response r = get_usb_response();
+		if (r.gotresponse && r.type == 32) break;
+	}
+}
+
 extern "C" void kmain(void) {
 	if (!LIMINE_BASE_REVISION_SUPPORTED) hcf();
 	if (!fb_req.response || fb_req.response->framebuffer_count < 1) hcf();
@@ -1138,9 +1167,6 @@ extern "C" void kmain(void) {
 		USB_Response resp = {false};
 		while (true) {
 			USB_Response tempresp = get_usb_response();
-//			if (!tempresp.gotresponse) {
-//				break;
-//			}
 			if (tempresp.type == 33) {
 				resp = tempresp;
 				break;
@@ -1276,11 +1302,11 @@ extern "C" void kmain(void) {
 		doorbell32[0] = 0;
 		
 		
-		resp = (USB_Response){false};
-		for (;;) {
-			USB_Response tmp = get_usb_response();
-			if (tmp.type == 33) { resp = tmp; break; } // Command Completion Event
-		}
+		resp = (USB_Response){false};                                                                     //  GGGG  EEEE TTTTTT    SSSS  UU    UU RRRR   FFFF  AAAAA   CCCC EEEE    KK  KK BBBB 
+		for (;;) {                                                                                        // GG     EE     TT     SSS    UU    UU RR RR  FF   AA   AA CC    EE      KK KK  BB BB
+			USB_Response tmp = get_usb_response();                                                        // GG GGG EEE    TT      SSS   UU    UU RRRR   FFFF AAAAAAA CC    EEE     KKKK   BBBB 
+			if (tmp.type == 33) { resp = tmp; break; } // Command Completion Event                        // GG  GG EE     TT        SSS UU    UU RR RR  FF   AA   AA CC    EE      KK KK  BB BB
+		}                                                                                                 //  GGGG  EEEE   TT      SSSS   UUUUUU  RR  RR FF   AA   AA  CCCC EEEE    KK  KK BBBB 
 		
 		if (!resp.gotresponse) {
 			print((char*)"Did not get response to Address Device");
@@ -1296,6 +1322,12 @@ extern "C" void kmain(void) {
 			// (Optional) dump sc32[0..3], ep32[0..4] here for quick forensics
 			continue;
 		}
+		
+		spin_delay(10000);  // Give device time to settle
+		
+		ep0_ctrl_no_data(slot_id, &ep0,
+                 0x00, 0x09 /*SET_CONFIGURATION*/, 1 /*wValue=config#*/, 0,
+                 doorbell32);
 		
 		spin_delay(10000);  // Give device time to settle
 		
@@ -1329,19 +1361,13 @@ extern "C" void kmain(void) {
 		for (;;) {
 			USB_Response tmp = get_usb_response();
 			print((char*)"Resp...");
-			if (tmp.gotresponse) {
-				print((char*)"has resp");
+			if (!tmp.gotresponse) {
+				continue;
 			}
-			if (!tmp.gotresponse) break;
+//			if (!tmp.gotresponse) break;
 			if (tmp.type == 33 || tmp.type == 32) { resp = tmp; break; }
 		}
 		
-		
-		// TELL KAI ABOUT THIS.
-//		if (!resp.gotresponse) {
-//			print((char*)"Did not get response to Boot Protocol");
-//			continue;
-//		}
 		
 		print((char*)"Boot protocol set");
 		
@@ -1593,87 +1619,90 @@ extern "C" void kmain(void) {
 			transfer_count++;
 			
 			uint32_t code = (resp.event->status >> 24) & 0xFF;
-			uint64_t trb_ptr = resp.event->parameter;
-			uint32_t transfer_len = resp.event->status & 0xFFFFFF;
+			uint64_t completed_trb_phys = resp.event->parameter & ~0xFULL;   // TRB pointer
+			volatile TRB* completed_trb = (volatile TRB*)(HHDM + completed_trb_phys);
+			uint64_t report_phys = completed_trb->parameter;                  // buffer phys
+			volatile uint8_t* report = (volatile uint8_t*)(HHDM + report_phys);
 			
 			print((char*)"Transfer event! Code:");
 			to_str(code, str);
 			print(str);
 			print((char*)"Residual length:");
-			to_str(transfer_len, str);
+			to_str(transfer_count, str);
 			print(str);
 			
 			if (code == 1 || code == 13) {  // Success or Short Packet
-				// Get the physical address from the TRB pointer
-				uint64_t report_phys = trb_ptr;
-				volatile uint8_t* report = (volatile uint8_t*)(HHDM + report_phys);
-				
-				// Debug: show raw report data
-				print((char*)"Report bytes:");
-				for (int b = 0; b < 8; b++) {
-					char hex_str[4];
-					uint8_t val = report[b];
-					hex_str[0] = HEX_NUMS[(val >> 4) & 0xF];
-					hex_str[1] = HEX_NUMS[val & 0xF];
-					hex_str[2] = ' ';
-					hex_str[3] = '\0';
-					print(hex_str);
-				}
-				
-				// Parse HID keyboard report
-				uint8_t modifiers = report[0];
-				bool shift = (modifiers & 0x22) != 0;
-				
-				// Check for new key presses
-				bool any_key = false;
-				for (int k = 2; k < 8; k++) {
-					uint8_t key = report[k];
-					if (key == 0) continue;
-					
-					any_key = true;
-					
-					// Check if this is a new key (not in last_keys)
-					bool is_new = true;
-					for (int j = 0; j < 6; j++) {
-						if (last_keys[j] == key) {
-							is_new = false;
-							break;
-						}
-					}
-					
-					if (is_new && key < 256) {
-						print((char*)"New key code:");
-						to_str(key, str);
-						print(str);
-						
-						char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
-						if (c != 0) {
-							print((char*)"Key pressed:");
-							char msg[2];
-							msg[0] = c;
-							msg[1] = '\0';
-							print(msg);
-						}
-					}
-				}
-				
-				// Update last_keys
-				for (int k = 0; k < 6; k++) {
-					last_keys[k] = report[k + 2];
-				}
-				
-				// Queue another transfer using the same buffer
-				volatile TRB *new_trb = &kbd_device.kbd_ring.trb[kbd_device.kbd_ring.enq];
-				new_trb->parameter = report_phys;
-				new_trb->status = 8;
-				new_trb->control = (1u << 10) | (1u << 5) | kbd_device.kbd_ring.pcs;
-				
-				if (++kbd_device.kbd_ring.enq == 255) {
-					kbd_device.kbd_ring.enq = 0;
-					kbd_device.kbd_ring.pcs ^= 1;
-				}
-				
-				doorbell32[kbd_device.slot_id] = 3;
+				print((char*)"Code1 || 13");
+//				// Get the physical address from the TRB pointer
+//				uint64_t report_phys = trb_ptr;
+//				volatile uint8_t* report = (volatile uint8_t*)(HHDM + report_phys);
+//				
+//				// Debug: show raw report data
+//				print((char*)"Report bytes:");
+//				for (int b = 0; b < 8; b++) {
+//					char hex_str[4];
+//					uint8_t val = report[b];
+//					hex_str[0] = HEX_NUMS[(val >> 4) & 0xF];
+//					hex_str[1] = HEX_NUMS[val & 0xF];
+//					hex_str[2] = ' ';
+//					hex_str[3] = '\0';
+//					print(hex_str);
+//				}
+//				
+//				// Parse HID keyboard report
+//				uint8_t modifiers = report[0];
+//				bool shift = (modifiers & 0x22) != 0;
+//				
+//				// Check for new key presses
+//				bool any_key = false;
+//				for (int k = 2; k < 8; k++) {
+//					uint8_t key = report[k];
+//					if (key == 0) continue;
+//					
+//					any_key = true;
+//					
+//					// Check if this is a new key (not in last_keys)
+//					bool is_new = true;
+//					for (int j = 0; j < 6; j++) {
+//						if (last_keys[j] == key) {
+//							is_new = false;
+//							break;
+//						}
+//					}
+//					
+//					if (is_new && key < 256) {
+//						print((char*)"New key code:");
+//						to_str(key, str);
+//						print(str);
+//						
+//						char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
+//						if (c != 0) {
+//							print((char*)"Key pressed:");
+//							char msg[2];
+//							msg[0] = c;
+//							msg[1] = '\0';
+//							print(msg);
+//						}
+//					}
+//				}
+//				
+//				// Update last_keys
+//				for (int k = 0; k < 6; k++) {
+//					last_keys[k] = report[k + 2];
+//				}
+//				
+//				// Queue another transfer using the same buffer
+//				volatile TRB *new_trb = &kbd_device.kbd_ring.trb[kbd_device.kbd_ring.enq];
+//				new_trb->parameter = report_phys;
+//				new_trb->status = 8;
+//				new_trb->control = (1u << 10) | (1u << 5) | kbd_device.kbd_ring.pcs;
+//				
+//				if (++kbd_device.kbd_ring.enq == 255) {
+//					kbd_device.kbd_ring.enq = 0;
+//					kbd_device.kbd_ring.pcs ^= 1;
+//				}
+//				
+//				doorbell32[kbd_device.slot_id] = 3;
 			} else {
 				print((char*)"Transfer error, not requeueing");
 			}
