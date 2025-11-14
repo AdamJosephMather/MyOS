@@ -48,8 +48,8 @@ run: iso
 		-no-reboot \
 		-no-shutdown \
 		-device qemu-xhci,id=xhci \
-		-device usb-kbd \
-		-device usb-mouse
+		-device usb-mouse \
+		-device usb-kbd
 	
 
 
