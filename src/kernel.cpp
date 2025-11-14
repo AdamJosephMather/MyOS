@@ -35,6 +35,13 @@ static volatile struct limine_hhdm_request hhdm_req = {
 	.revision = 0
 };
 
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_stack_size_request stack_size_req = {
+	.id        = LIMINE_STACK_SIZE_REQUEST,
+	.revision  = 0,
+	.stack_size = 1024 * 1024
+};
+
 __attribute__((used, section(".limine_requests_start")))
 static volatile LIMINE_REQUESTS_START_MARKER;
 __attribute__((used, section(".limine_requests_end")))
@@ -45,6 +52,16 @@ struct limine_framebuffer *fb;
 uint64_t HHDM;
 bool debug = false;
 
+
+template<typename T>
+void zero(T& obj) {
+	volatile unsigned char* ptr = reinterpret_cast<volatile unsigned char*>(&obj);
+	for (size_t i = 0; i < sizeof(T); i++) {
+		ptr[i] = 0;
+	}
+}
+
+volatile uint32_t* doorbell32 = nullptr;
 
 static const char map_unshift[0x60] = {
 /*00*/0,  27, '1','2','3','4','5','6','7','8','9','0','-','=', 8,  9,
@@ -294,6 +311,21 @@ void print(char* buffer) {
 		i++;
 	}
 	current_print_line ++;
+}
+
+extern "C" void* memset(void* dst, int c, size_t n) {
+	print((char*)"Memset");
+	unsigned char* p = (unsigned char*)dst;
+	while (n--) *p++ = (unsigned char)c;
+	return dst;
+}
+
+extern "C" void* memcpy(void* dst, const void* src, size_t n) {
+	print((char*)"Memcpy");
+	unsigned char* d = (unsigned char*)dst;
+	const unsigned char* s = (const unsigned char*)src;
+	while (n--) *d++ = *s++;
+	return dst;
 }
 
 char HEX_NUMS[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
@@ -632,8 +664,8 @@ struct USBDevice {
 	uint8_t slot_id;
 	uint8_t port_num;     // port number on *parent* hub/root (1-based)
 	uint32_t speed;
-	struct Ring ep0_ring;
-	struct Ring kbd_ring;
+	struct Ring* ep0_ring;
+	struct Ring* kbd_ring;
 	volatile uint64_t* device_ctx;
 	bool is_hub;
 	bool is_keyboard;
@@ -675,72 +707,93 @@ USB_Response get_usb_response(int timeout = 1000000) {
 		// return info
 		uint32_t type = (ctrl >> 10) & 0x3F;
 		
-		USB_Response resp = {};
+		USB_Response resp;
 		resp.gotresponse = true;
 		resp.event = evt;
 		resp.type = type;
 		resp.ctrl = ctrl;
 		return resp;
 	}
-	return {false};
+	
+	USB_Response resp;
+	resp.gotresponse = false;
+	return resp;
 }
 
-/*
- * Helper control-transfer-on-EP0:
- * - Builds a setup TRB and status TRB on the device's ep0_ring and rings slot's doorbell 1
- * - Waits for Command Completion / Transfer Event and returns response
- *
- * Notes: This is a simplified helper that uses the device's ep0_ring that we created at slot enable time.
- */
-USB_Response do_control_transfer(USBDevice &dev, USBSetupPacket* setup, volatile uint8_t* data_buffer, uint16_t data_len) {
-	// Build setup DWORD (immediate data in param)
+// TRB type constants
+static constexpr uint32_t TRB_TYPE_SETUP_STAGE  = 2u;
+static constexpr uint32_t TRB_TYPE_DATA_STAGE   = 3u;
+static constexpr uint32_t TRB_TYPE_STATUS_STAGE = 4u;
+
+// Helper to compute TRT (bits 17:16) for Setup Stage TRB
+static inline uint32_t setup_trt(uint8_t bmRequestType, uint16_t wLength) {
+	if (wLength == 0) return 0u;                 // No data stage
+	return (bmRequestType & 0x80) ? 2u : 3u;     // IN data stage -> 2, OUT -> 3
+}
+
+USB_Response do_control_transfer(USBDevice &dev,
+								 USBSetupPacket* setup,
+								 volatile uint8_t* data_buffer,
+								 uint16_t data_len) {
+	print((char*)" a");
+	// Encode setup packet as immediate data (little-endian)
 	uint64_t setup_dw0 = ((uint64_t)setup->bmRequestType) |
-						 ((uint64_t)setup->bRequest << 8) |
-						 ((uint64_t)setup->wValue << 16) |
-						 ((uint64_t)setup->wIndex << 32) |
-						 ((uint64_t)setup->wLength << 48);
+						 ((uint64_t)setup->bRequest   << 8)  |
+						 ((uint64_t)setup->wValue     << 16) |
+						 ((uint64_t)setup->wIndex     << 32) |
+						 ((uint64_t)setup->wLength    << 48);
 
-	// Setup Stage TRB: type=2 (Setup), IDT=1 (immediate in param)
-	ring_push_cmd(&dev.ep0_ring, (2u << 10) | (8 << 16) | (1 << 6), setup_dw0, 0);
+	print((char*)" b");
+	// ---- Setup Stage TRB ----
+	// status must be 8, control sets: Type, IDT=1, and TRT in bits 17:16
+	const uint32_t setup_status = 8u;
+	const uint32_t setup_ctrl =
+		(TRB_TYPE_SETUP_STAGE << 10) | (1u << 6) | (setup_trt(setup->bmRequestType, setup->wLength) << 16);
+	ring_push_cmd(dev.ep0_ring, setup_ctrl, setup_dw0, setup_status);
+	
+	print((char*)" c");
 
-	// If there is a data stage (IN or OUT), add appropriate TRBs.
-	// For simplicity we treat device->host (IN) as needing a Data Stage IN TRB, and host->device (OUT) uses Data Stage OUT.
-	if ((setup->bmRequestType & 0x80) == 0x80 && data_len > 0) {
-		// IN data stage (Device-to-host)
-		// TRB type=3 (Data Stage), Direction=IN
-		ring_push_cmd(&dev.ep0_ring, (3u << 10) | (data_len << 16), (uint64_t)0 /* param immediate not used for IN */, 0);
-		// Status Stage (OUT)
-		ring_push_cmd(&dev.ep0_ring, (4u << 10) | (1 << 16) | (1 << 5), 0, 0);  // Status OUT, IOC
-	} else if ((setup->bmRequestType & 0x80) == 0x00 && data_len > 0) {
-		// OUT data stage (Host-to-device)
-		// We pass the physical buffer pointer as the parameter of Data Stage TRB (Normal style)
+	// ---- Optional Data Stage TRB ----
+	const bool has_data = (data_len > 0);
+	const bool data_is_in = (setup->bmRequestType & 0x80) != 0;
+	
+	print((char*)" d");
+
+	if (has_data) {
 		uint64_t data_phys = (uint64_t)data_buffer - HHDM;
-		ring_push_cmd(&dev.ep0_ring, (3u << 10) | (data_len << 16), data_phys, 0);
-		// Status Stage (IN)
-		ring_push_cmd(&dev.ep0_ring, (4u << 10) | (1 << 16) | (1 << 5), 0, 0);  // Status IN, IOC
-	} else {
-		// No data stage - just a status stage opposite direction of setup
-		// If setup direction is host->device, status is IN; vice versa.
-		if ((setup->bmRequestType & 0x80) == 0x80) {
-			// Setup was Device->Host (rare), status is OUT
-			ring_push_cmd(&dev.ep0_ring, (4u << 10) | (1 << 16) | (1 << 5), 0, 0);  // Status OUT
-		} else {
-			ring_push_cmd(&dev.ep0_ring, (4u << 10) | (1 << 16) | (1 << 5), 0, 0);  // Status IN
-		}
-	}
 
-	// Ring doorbell for EP0 (doorbell index for slot)
-	// doorbell32 is a global pointer set during xHCI init (see main)
-	extern volatile uint32_t* doorbell32;
+		// Direction bit (bit 16) == 1 for IN, 0 for OUT
+		uint32_t data_ctrl = (TRB_TYPE_DATA_STAGE << 10) | (data_is_in ? (1u << 16) : 0u);
+		uint32_t data_status = (uint32_t)data_len;  // length goes in "status" dword
+
+		ring_push_cmd(dev.ep0_ring, data_ctrl, data_phys, data_status);
+	}
+	
+	print((char*)" e");
+
+	// ---- Status Stage TRB ----
+	// Status direction is the OPPOSITE of the request direction
+	uint32_t status_dir_bit = data_is_in ? 0u : (1u << 16);  // IN request => OUT status (0), OUT request => IN status (1<<16)
+	uint32_t status_ctrl = (TRB_TYPE_STATUS_STAGE << 10) | status_dir_bit | (1u << 5); // IOC on status
+
+	ring_push_cmd(dev.ep0_ring, status_ctrl, 0, 0);
+	
+	print((char*)" f");
+
+	// ---- Ring doorbell for EP0 (DCI=1) ----
 	doorbell32[dev.slot_id] = 1;
 
-	// Wait for completion events. We will accept either Command Completion (33) or Transfer Event (32)
-	USB_Response resp = {false};
+	// ---- Wait for either Transfer Event (32) or Command Completion (33) ----
+	print((char*)" g");
+	USB_Response resp;
 	for (;;) {
-		USB_Response tmp = get_usb_response();
-		if (!tmp.gotresponse) break;
-		if (tmp.type == 33 || tmp.type == 32) {
-			resp = tmp;
+		resp = get_usb_response();
+		if (!resp.gotresponse) {
+			continue;
+		}
+		print((char*)" h");
+		if (resp.type == 32 || resp.type == 33) {
+			print((char*)" i");
 			break;
 		}
 	}
@@ -748,50 +801,73 @@ USB_Response do_control_transfer(USBDevice &dev, USBSetupPacket* setup, volatile
 }
 
 // small helper: get device descriptor (18 bytes)
-bool get_device_descriptor(USBDevice &dev, uint8_t* outbuf18) {
+bool get_device_descriptor(USBDevice &dev, volatile uint8_t* outbuf18) {
 	volatile uint8_t* buf = (volatile uint8_t*)alloc_table(); // one page for simplicity
+	print((char*)"a");
 	for (int i=0;i<4096;i++) buf[i]=0;
-	uint16_t buf_phys = (uint16_t)((uint64_t)buf - HHDM);
-
-	USBSetupPacket setup = {};
+	
+	print((char*)"b");
+	
+	USBSetupPacket setup;
 	setup.bmRequestType = 0x80; // Device to host, Standard, Device
 	setup.bRequest = 0x06; // GET_DESCRIPTOR
 	setup.wValue = (0x01 << 8) | 0; // DEVICE descriptor (type=1, index=0)
 	setup.wIndex = 0;
 	setup.wLength = 18;
-
-	USB_Response r = do_control_transfer(dev, &setup, (volatile uint8_t*)buf, 18);
+	
+	print((char*)"c");
+	USB_Response r = do_control_transfer(dev, &setup, buf, 18);
 	if (!r.gotresponse) return false;
-
+	print((char*)"c");
 	// copy first 18 bytes out
 	for (int i=0;i<18;i++) outbuf18[i] = buf[i];
+	print((char*)"d");
 	return true;
 }
 
 // get configuration descriptor header first (9 bytes) then full config
-bool get_configuration_descriptor(USBDevice &dev, uint8_t* outbuf, uint16_t maxlen) {
+// get full configuration descriptor in a single control transfer
+bool get_configuration_descriptor(USBDevice &dev, volatile uint8_t* outbuf, uint16_t maxlen) {
+	print((char*)"cfg a");
+
+	// Temporary page for the device to write into
 	volatile uint8_t* buf = (volatile uint8_t*)alloc_table();
-	for (int i=0;i<4096;i++) buf[i]=0;
+	for (int i = 0; i < 4096; i++) buf[i] = 0;
 
-	USBSetupPacket setup = {};
-	setup.bmRequestType = 0x80; // Device to host, Standard, Device
-	setup.bRequest = 0x06; // GET_DESCRIPTOR
-	setup.wValue = (0x02 << 8) | 0; // CONFIG descriptor
-	setup.wIndex = 0;
-	setup.wLength = 9;
+	print((char*)"cfg b");
 
-	USB_Response r = do_control_transfer(dev, &setup, (volatile uint8_t*)buf, 9);
-	if (!r.gotresponse) return false;
+	USBSetupPacket setup;
+	setup.bmRequestType = 0x80;           // Device->Host, Standard, Device
+	setup.bRequest      = 0x06;           // GET_DESCRIPTOR
+	setup.wValue        = (0x02 << 8) | 0; // CONFIG descriptor (type=2, index=0)
+	setup.wIndex        = 0;
+	setup.wLength       = maxlen;         // ask for as much as we'll accept
 
+	print((char*)"cfg c");
+
+	USB_Response r = do_control_transfer(dev, &setup, buf, maxlen);
+	if (!r.gotresponse) {
+		print((char*)"cfg: no response");
+		return false;
+	}
+
+	print((char*)"cfg d");
+
+	// The actual total length is in wTotalLength at bytes 2–3
 	uint16_t total_len = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+	if (total_len == 0) {
+		print((char*)"cfg: wTotalLength=0");
+		return false;
+	}
 	if (total_len > maxlen) total_len = maxlen;
 
-	// now request full config
-	setup.wLength = total_len;
-	r = do_control_transfer(dev, &setup, (volatile uint8_t*)buf, total_len);
-	if (!r.gotresponse) return false;
+	// Copy out only the real descriptor length
+	for (int i = 0; i < total_len; i++) {
+		outbuf[i] = buf[i];
+	}
 
-	for (int i=0;i<total_len;i++) outbuf[i] = buf[i];
+	print((char*)"cfg e");
+
 	return true;
 }
 
@@ -800,7 +876,7 @@ bool get_hub_descriptor(USBDevice &dev, uint8_t* outbuf, uint16_t len) {
 	volatile uint8_t* buf = (volatile uint8_t*)alloc_table();
 	for (int i=0;i<4096;i++) buf[i]=0;
 
-	USBSetupPacket setup = {};
+	USBSetupPacket setup;
 	setup.bmRequestType = 0xA0; // Device to host, Class, Device? (0xA0 or 0xA3 for other forms). Using 0xA0 to request on device
 	setup.bRequest = 0x06; // GET_DESCRIPTOR
 	setup.wValue = (0x29 << 8) | 0;
@@ -819,7 +895,7 @@ bool hub_set_port_feature(USBDevice &hub, uint16_t port, uint16_t feature_select
 	volatile uint8_t* tmp = (volatile uint8_t*)alloc_table();
 	for (int i=0;i<4096;i++) tmp[i]=0;
 
-	USBSetupPacket setup = {};
+	USBSetupPacket setup;
 	setup.bmRequestType = 0x23; // Host to device, Class, Other (port)
 	setup.bRequest = 0x03; // SET_FEATURE
 	setup.wValue = feature_selector;
@@ -835,7 +911,7 @@ bool hub_get_port_status(USBDevice &hub, uint16_t port, uint8_t* status4) {
 	volatile uint8_t* tmp = (volatile uint8_t*)alloc_table();
 	for (int i=0;i<4096;i++) tmp[i]=0;
 
-	USBSetupPacket setup = {};
+	USBSetupPacket setup;
 	setup.bmRequestType = 0xA3; // Device to host, Class, Other (port)
 	setup.bRequest = 0x00; // GET_STATUS
 	setup.wValue = 0;
@@ -851,14 +927,12 @@ bool hub_get_port_status(USBDevice &hub, uint16_t port, uint8_t* status4) {
 
 // Array for found keyboards
 #define MAX_KEYBOARDS 8
-USBDevice keyboards[MAX_KEYBOARDS];
+USBDevice* keyboards[MAX_KEYBOARDS];
 int keyboard_count = 0;
 
 // Global doorbell pointer (set in main after mapping)
-volatile uint32_t* doorbell32 = nullptr;
-
 // Forward declaration of function used for recursion
-void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, volatile uint8_t* rt_base, volatile uint32_t* doorbell32_ptr, struct Ring &cr, uint32_t hcc1, uint32_t hcs1, uint32_t hcs2);
+void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, volatile uint8_t* rt_base, struct Ring &cr, uint32_t hcc1, uint32_t hcs1, uint32_t hcs2);
 
 // Recursively enumerate hub's downstream ports and address devices
 void enumerate_hub_children(USBDevice &hub, volatile XHCIOpRegs* ops, struct Ring &cr, uint8_t max_depth = 8) {
@@ -904,9 +978,9 @@ void enumerate_hub_children(USBDevice &hub, volatile XHCIOpRegs* ops, struct Rin
 		// NOTE: xHCI requires setting slot context's root hub port number to the upstream port (here we use hub.port_num as parent)
 		// We'll re-run the same pattern used in root port enumeration, but mark the slot's Root Hub Port Number with the hub's port.
 		// Build EP0 transfer ring
-		struct Ring ep0;
-		ring_init(&ep0);
-		uint64_t ep0_ring_phys = ep0.phys;
+		struct Ring *ep0;
+		ring_init(ep0);
+		uint64_t ep0_ring_phys = ep0->phys;
 
 		// Enable Slot command
 		ring_push_cmd(&cr, (9u<<10), 0, 0);
@@ -977,7 +1051,7 @@ void enumerate_hub_children(USBDevice &hub, volatile XHCIOpRegs* ops, struct Rin
 		if (code != 1) { print((char*)"Address Device failed for hub child"); continue; }
 
 		// create USBDevice record for child
-		USBDevice child = {};
+		USBDevice child;
 		child.slot_id = slot_id;
 		child.port_num = p; // downstream port number on this hub
 		child.ep0_ring = ep0;
@@ -989,9 +1063,9 @@ void enumerate_hub_children(USBDevice &hub, volatile XHCIOpRegs* ops, struct Rin
 		// - Evaluate Context (omitted for brevity since controller may have set correct EP0 sizes)
 		// - Set Boot Protocol (if HID)
 		// - Read descriptors and decide whether this is a hub or keyboard and recurse or initialize keyboard
-
+		
 		// We'll call a helper that uses the same logic as the root enumeration to finish device setup and to detect hub/keyboard.
-		enumerate_device_after_address(child, ops, nullptr, doorbell32, cr, 0, 0, 0);
+		enumerate_device_after_address(child, ops, nullptr, cr, 0, 0, 0);
 		// If the child is a hub, recursively enumerate its children
 		if (child.is_hub) {
 			enumerate_hub_children(child, ops, cr, max_depth - 1);
@@ -1001,13 +1075,13 @@ void enumerate_hub_children(USBDevice &hub, volatile XHCIOpRegs* ops, struct Rin
 
 // This helper finishes device setup after Address Device and determines whether the device is
 // a keyboard or hub (or neither). If it's a keyboard, sets up an interrupt endpoint and registers it.
-void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, volatile uint8_t* rt_base, volatile uint32_t* doorbell32_ptr, struct Ring &cr, uint32_t hcc1, uint32_t hcs1, uint32_t hcs2) {
-	// Save global doorbell pointer
-	doorbell32 = doorbell32_ptr;
-
+void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, volatile uint8_t* rt_base, struct Ring &cr, uint32_t hcc1, uint32_t hcs1, uint32_t hcs2) {
+	print((char*)"Enumerating device.");
 	// Create a small buffer and get the device descriptor
-	uint8_t devdesc[18];
+	volatile uint8_t devdesc[18];
 	for (int i=0;i<18;i++) devdesc[i]=0;
+	print((char*)"Got to here 0.");
+	
 	if (!get_device_descriptor(dev, devdesc)) {
 		print((char*)"Failed to read device descriptor after address");
 		return;
@@ -1015,14 +1089,17 @@ void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, vo
 	uint8_t dev_class = devdesc[4];
 	uint8_t dev_subclass = devdesc[5];
 	uint8_t dev_protocol = devdesc[6];
-
+	print((char*)"Got to here 1.");
+	
 	// Get configuration descriptor and parse interfaces
-	uint8_t config_buf[512];
+	volatile uint8_t config_buf[512];
 	for (int i=0;i<512;i++) config_buf[i]=0;
+	print((char*)"Got to here 1.1.");
 	if (!get_configuration_descriptor(dev, config_buf, 512)) {
 		print((char*)"Failed to read config descriptor");
 		// still continue; device may be non-keyboard/hub
 	}
+	print((char*)"Got to here 2.");
 
 	// Parse config to find interface descriptors and check for HID Keyboard (interface class 0x03, subclass 1, protocol 1)
 	bool found_hid_keyboard = false;
@@ -1032,6 +1109,8 @@ void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, vo
 	if (dev_class == 0x09) {
 		found_hub_device = true;
 	}
+	
+	print((char*)"Got to here 3.");
 
 	// Search through config_buf for interface descriptors: bDescriptorType==4 (Interface)
 	int idx = 0;
@@ -1054,6 +1133,8 @@ void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, vo
 		if (btype == 0x0F /*Hub class specific? - ignored here*/) {}
 		idx += blen;
 	}
+	
+	print((char*)"Got to here 4.");
 
 	// Mark device
 	dev.is_keyboard = found_hid_keyboard;
@@ -1063,6 +1144,8 @@ void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, vo
 		print((char*)"Device is not keyboard or hub; skipping.");
 		return;
 	}
+	
+	print((char*)"Got to here 5.");
 
 	if (found_hub_device) {
 		// This is a hub. Keep EP0 for hub requests and then do hub-specific initialization.
@@ -1071,11 +1154,15 @@ void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, vo
 		// We'll leave ep0 set up for hub class requests; children enumeration will be triggered externally
 		return;
 	}
+	
+	print((char*)"Got to here 6.");
 
 	// If it's a keyboard, set Boot Protocol and configure interrupt endpoint (this mirrors original code)
 	// Set Boot Protocol (HID-specific)
 	volatile uint8_t* setup_buf = (volatile uint8_t*)alloc_table();
 	uint64_t setup_phys = (uint64_t)setup_buf - HHDM;
+	
+	print((char*)"Got to here 7.");
 
 	USBSetupPacket* setup = (USBSetupPacket*)setup_buf;
 	setup->bmRequestType = 0x21;  // Host to Device, Class, Interface
@@ -1083,48 +1170,66 @@ void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, vo
 	setup->wValue = 0;            // Boot protocol
 	setup->wIndex = 0;            // Interface 0
 	setup->wLength = 0;
+	
+	print((char*)"Got to here 8.");
 
 	uint64_t setup_dw0 = ((uint64_t)setup->bmRequestType) | 
 	                     ((uint64_t)setup->bRequest << 8) |
 	                     ((uint64_t)setup->wValue << 16) |
 	                     ((uint64_t)setup->wIndex << 32) |
 	                     ((uint64_t)setup->wLength << 48);
+	
+	print((char*)"Got to here 9.");
 
 	// push setup and status onto ep0_ring and ring doorbell for slot
-	ring_push_cmd(&dev.ep0_ring, (2u << 10) | (8 << 16) | (1 << 6), setup_dw0, 0);  // Setup Stage, IDT=1
+	ring_push_cmd(dev.ep0_ring, (2u << 10) | (8 << 16) | (1 << 6), setup_dw0, 0);  // Setup Stage, IDT=1
 	// Status Stage TRB (IN direction, IOC=1)
-	ring_push_cmd(&dev.ep0_ring, (4u << 10) | (1 << 16) | (1 << 5), 0, 0);  // Status IN, IOC
+	ring_push_cmd(dev.ep0_ring, (4u << 10) | (1 << 16) | (1 << 5), 0, 0);  // Status IN, IOC
 
 	doorbell32[dev.slot_id] = 1;  // Ring EP0
+	
+	print((char*)"Got to here 10.");
+	
 	{
-		USB_Response resp = {false};
+		USB_Response resp;
+		print((char*)"Got to here 11.");
 		for (;;) {
-			USB_Response tmp = get_usb_response();
-			if (!tmp.gotresponse) break;
-			if (tmp.type == 33 || tmp.type == 32) { resp = tmp; break; }
+			resp = get_usb_response();
+			if (!resp.gotresponse) break;
+			if (resp.type == 33 || resp.type == 32) { break; }
 		}
 		// ignore result here; continue to configure endpoint
 	}
-
+	
+	print((char*)"Got to here 12.");
+	
 	// Configure interrupt IN endpoint for keyboard similar to original code:
-	ring_init(&dev.kbd_ring);
+	struct Ring kbd_ring;
+	ring_init(&kbd_ring);
+	dev.kbd_ring = &kbd_ring;
 	volatile uint64_t* input_ctx2 = alloc_table();
 	uint64_t input_ctx2_phys = (uint64_t)input_ctx2 - HHDM;
 	for (int j = 0; j < 512; j++) input_ctx2[j] = 0;
 	volatile InputControlCtx *icc2 = (volatile InputControlCtx*)input_ctx2;
 	icc2->add_flags = (1 << 0) | (1 << 3);  // Add slot context (bit 0) + EP1 IN (DCI=3, bit 3)
 	icc2->drop_flags = 0;
+	
+	print((char*)"Got to here 13.");
 
 	// Copy slot context from device output context
 	volatile uint32_t* dev_slot_ctx = (volatile uint32_t*)dev.device_ctx;
 	volatile uint32_t* slot_ctx2_dw = (volatile uint32_t*)(input_ctx2 + 4);
 	for (int j = 0; j < 8; j++) slot_ctx2_dw[j] = dev_slot_ctx[j];
 	slot_ctx2_dw[0] = (slot_ctx2_dw[0] & ~(0x1F << 27)) | ((3 & 0x1F) << 27);
+	
+	print((char*)"Got to here 14.");
 
 	// Copy EP0 context from device output context
 	volatile uint32_t* dev_ep0_ctx = (volatile uint32_t*)(dev.device_ctx + 4);
 	volatile uint32_t* ep0_ctx2_dw = (volatile uint32_t*)(input_ctx2 + 8);
 	for (int j = 0; j < 8; j++) ep0_ctx2_dw[j] = dev_ep0_ctx[j];
+	
+	print((char*)"Got to here 15.");
 
 	// EP1 IN context at DCI=3
 	volatile uint32_t* ep1_ctx_dw = (volatile uint32_t*)(input_ctx2 + 16);
@@ -1132,31 +1237,34 @@ void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, vo
 	uint8_t interval = 3;
 	ep1_ctx_dw[0] = (interval << 16);
 	ep1_ctx_dw[1] = (3 << 1) | (7 << 3) | (0 << 8) | (8 << 16);
-	ep1_ctx_dw[2] = (uint32_t)(dev.kbd_ring.phys | 1);
-	ep1_ctx_dw[3] = (uint32_t)(dev.kbd_ring.phys >> 32);
+	ep1_ctx_dw[2] = (uint32_t)(dev.kbd_ring->phys | 1);
+	ep1_ctx_dw[3] = (uint32_t)(dev.kbd_ring->phys >> 32);
 	ep1_ctx_dw[4] = 8;
+	
+	print((char*)"Got to here 16.");
 
 	// Configure Endpoint command
 	ring_push_cmd(&cr, (12u << 10) | (dev.slot_id << 24), input_ctx2_phys, 0);
 	doorbell32[0] = 0;
 
 	{
-		USB_Response resp = (USB_Response){false};
+		USB_Response resp;
+		resp.gotresponse = false;
+		
 		for (;;) {
-			USB_Response tmp = get_usb_response();
-			if (!tmp.gotresponse) break;
-			if (tmp.type == 33) { resp = tmp; break; } // Command Completion Event
-		}
-		if (!resp.gotresponse) {
-			print((char*)"Timeout configuring endpoint for keyboard");
-			return;
+			resp = get_usb_response();
+			if (!resp.gotresponse) continue;
+			if (resp.type == 33) { break; } // Command Completion Event
 		}
 		uint32_t code = (resp.event->status >> 24) & 0xFF;
 		if (code != 1) {
 			print((char*)"Configure endpoint failed for keyboard");
 			return;
+		}else{
+			print((char*)"Configured endpoint for keyboard");
 		}
 	}
+	print((char*)"Got to here 17.");
 
 	// Queue initial transfer using ring
 	volatile uint8_t* kbd_buffer1 = (volatile uint8_t*)alloc_table();
@@ -1164,18 +1272,28 @@ void enumerate_device_after_address(USBDevice &dev, volatile XHCIOpRegs* ops, vo
 	uint64_t kbd_buffer1_phys = (uint64_t)kbd_buffer1 - HHDM;
 	uint64_t kbd_buffer2_phys = (uint64_t)kbd_buffer2 - HHDM;
 	for (int j = 0; j < 4096; j++) kbd_buffer1[j] = kbd_buffer2[j] = 0;
+	
+	print((char*)"Got to here 18.");
 
-	volatile TRB *trb1 = &dev.kbd_ring.trb[dev.kbd_ring.enq];
+	volatile TRB *trb1 = &dev.kbd_ring->trb[dev.kbd_ring->enq];
 	trb1->parameter = kbd_buffer1_phys;
 	trb1->status = 8;
-	trb1->control = (1u << 10) | (1u << 5) | dev.kbd_ring.pcs;
-	if (++dev.kbd_ring.enq == 255) { dev.kbd_ring.enq = 0; dev.kbd_ring.pcs ^= 1; }
+	trb1->control = (1u << 10) | (1u << 5) | dev.kbd_ring->pcs;
+	
+	print((char*)"Got to here 19.");
+	
+	if (++dev.kbd_ring->enq == 255) { dev.kbd_ring->enq = 0; dev.kbd_ring->pcs ^= 1; }
+	
+	print((char*)"Got to here 20.");
 
 	doorbell32[dev.slot_id] = 3;  // Ring EP1 IN
+	
+	print((char*)"Got to here 21.");
 
 	// Save into keyboards array if space
 	if (keyboard_count < MAX_KEYBOARDS) {
-		keyboards[keyboard_count++] = dev;
+		print((char*)"Putting it into it's place");
+		keyboards[keyboard_count++] = &dev;
 		print((char*)"Registered a keyboard.");
 	} else {
 		print((char*)"Keyboard array full; not registering extra keyboard.");
@@ -1195,6 +1313,11 @@ extern "C" void kmain(void) {
 	
 	if (!hhdm_req.response) {
 		print((char*)"Error: No hhdm response");
+		hcf();
+	}
+	
+	if (stack_size_req.response == NULL) {
+		print((char*)"Error: No didn't increase stack size");
 		hcf();
 	}
 	
@@ -1268,14 +1391,7 @@ extern "C" void kmain(void) {
 		uint64_t entry_va = HHDM + (uint64_t)entry_pa;
 		volatile uint8_t *entry = (volatile uint8_t *)entry_va;
 		
-		char str[5];
-		str[0] = entry[0];
-		str[1] = entry[1];
-		str[2] = entry[2];
-		str[3] = entry[3];
-		str[4] = '\0';
-	
-		if (str[0] == 'M' && str[1] == 'C' && str[2] == 'F' && str[3] == 'G') {
+		if (entry[0] == 'M' && entry[1] == 'C' && entry[2] == 'F' && entry[3] == 'G') {
 			ptr_mcfg = entry;
 			break;
 		}
@@ -1465,7 +1581,7 @@ extern "C" void kmain(void) {
 	while (ops->usbcmd & (1u << 1)) { }
 	while (ops->usbsts & (1u << 11)) { }
 	
-	struct Ring cr = {};
+	struct Ring cr;
 	ring_init(&cr);
 	ops->crcr = (cr.phys & ~0x3FULL) | 1;
 	
@@ -1592,8 +1708,6 @@ extern "C" void kmain(void) {
 			}
 		}
 		
-		print((char*)"With resp.");
-		
 		if (!resp.gotresponse) {
 			print((char*)"Not available.");
 			return false;
@@ -1625,6 +1739,8 @@ extern "C" void kmain(void) {
 		uint32_t v = *portsc;
 		if (!(v & PORTSC_CCS)) continue;
 		
+		print((char*)"");
+		
 		print((char*)"Device on port ");
 		to_str(i+1, str);
 		print(str);
@@ -1637,11 +1753,12 @@ extern "C" void kmain(void) {
 		ring_push_cmd(&cr, (9u<<10), 0, 0);
 		doorbell32[0] = 0;
 		
-		USB_Response resp = {false};
+		USB_Response resp;
 		while (true) {
-			USB_Response tempresp = get_usb_response();
-			if (tempresp.type == 33) {
-				resp = tempresp;
+			resp = get_usb_response();
+			if (!resp.gotresponse) { continue; }
+			if (resp.type == 33) {
+				resp = resp;
 				break;
 			}
 		}
@@ -1666,7 +1783,6 @@ extern "C" void kmain(void) {
 			continue;
 		}
 		
-		// Build EP0 transfer ring
 		struct Ring ep0;
 		ring_init(&ep0);
 		uint64_t ep0_ring_phys = ep0.phys;
@@ -1771,15 +1887,10 @@ extern "C" void kmain(void) {
 		doorbell32[0] = 0;
 		
 		
-		resp = (USB_Response){false};
 		for (;;) {
-			USB_Response tmp = get_usb_response();
-			if (tmp.type == 33) { resp = tmp; break; } // Command Completion Event
-		}
-		
-		if (!resp.gotresponse) {
-			print((char*)"Did not get response to Address Device");
-			continue;
+			resp = get_usb_response();
+			if (!resp.gotresponse) { continue; }
+			if (resp.type == 33) { break; } // Command Completion Event
 		}
 		
 		code = (resp.event->status >> 24) & 0xFF;
@@ -1794,24 +1905,25 @@ extern "C" void kmain(void) {
 		spin_delay(10000);  // Give device time to settle
 		
 		// Create USBDevice for this slot
-		USBDevice newdev = {};
+		USBDevice newdev;
 		newdev.slot_id = slot_id;
 		newdev.port_num = i+1;
 		newdev.speed = speed;
-		newdev.ep0_ring = ep0;
-		newdev.kbd_ring = {}; // will be initialized if keyboard
+		newdev.ep0_ring = &ep0;
+//		newdev.kbd_ring; // will be initialized if keyboard
 		newdev.device_ctx = dev_ctx;
 		newdev.dev_ctx_phys = dev_ctx_phys;
-
+		
 		// Determine if this is hub or keyboard and finish setup
-		enumerate_device_after_address(newdev, ops, rt_base, doorbell32_local, cr, hcc1, hcs1, hcs2);
+		enumerate_device_after_address(newdev, ops, rt_base, cr, hcc1, hcs1, hcs2);
 
 		// If it's a hub, recurse into children
 		if (newdev.is_hub) {
 			enumerate_hub_children(newdev, ops, cr, 8);
 		}
 	}
-
+	
+	print((char*)"");
 	print((char*)"Finished root port enumeration.");
 	
 	// Now we should have registered keyboards in keyboards[]
@@ -1865,10 +1977,10 @@ extern "C" void kmain(void) {
 				// Find which keyboard owns this buffer (match by buffer pointer)
 				int which_kbd = -1;
 				for (int k=0;k<keyboard_count;k++) {
-					USBDevice &kd = keyboards[k];
+					USBDevice *kd = keyboards[k];
 					// We compare physical ring base or slot id: simpler: check slot id match with event CTRL if available
 					uint32_t slot_from_event = (resp.ctrl >> 24) & 0xFF;
-					if (slot_from_event == kd.slot_id) { which_kbd = k; break; }
+					if (slot_from_event == kd->slot_id) { which_kbd = k; break; }
 				}
 				if (which_kbd < 0) {
 					// fallback: check report contents
@@ -1915,19 +2027,19 @@ extern "C" void kmain(void) {
 				for (int kk = 0; kk < 6; kk++) last_keys[k][kk] = report[kk + 2];
 				
 				// Re-queue TRB on this keyboard's ring using same buffer
-				USBDevice &kd = keyboards[k];
-				volatile TRB *new_trb = &kd.kbd_ring.trb[kd.kbd_ring.enq];
+				USBDevice *kd = keyboards[k];
+				volatile TRB *new_trb = &kd->kbd_ring->trb[kd->kbd_ring->enq];
 				new_trb->parameter = report_phys;
 				new_trb->status = 8;
-				new_trb->control = (1u << 10) | (1u << 5) | kd.kbd_ring.pcs;
+				new_trb->control = (1u << 10) | (1u << 5) | kd->kbd_ring->pcs;
 				
-				if (++kd.kbd_ring.enq == 255) {
-					kd.kbd_ring.enq = 0;
-					kd.kbd_ring.pcs ^= 1;
+				if (++kd->kbd_ring->enq == 255) {
+					kd->kbd_ring->enq = 0;
+					kd->kbd_ring->pcs ^= 1;
 				}
 				
 				// Ring the doorbell for the slot's EP1 (DCI=3)
-				doorbell32[kd.slot_id] = 3;
+				doorbell32[kd->slot_id] = 3;
 			}
 		}
 	}
