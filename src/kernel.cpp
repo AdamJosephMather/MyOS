@@ -1792,6 +1792,7 @@ extern "C" void kmain(void) {
 		
 		print((char*)"Speed:");
 		to_str(speed, str); print(str);
+		hcf();
 		
 		// Allocate device *output* context and hook it into DCBAA
 		volatile uint64_t* dev_ctx = alloc_table();          // 4 KiB, aligned
