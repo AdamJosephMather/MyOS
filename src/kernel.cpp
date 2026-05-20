@@ -284,8 +284,8 @@ pre_flip_hook_fn  g_pre_flip_hook  = nullptr;
 static uint64_t last_mouse_flip_tsc = 0;
 
 // Phase 9: Terminal window origin + size (set by wm_init)
-int32_t g_term_ox = 8;          // fallback: full-screen margin
-int32_t g_term_oy = 8;
+int32_t g_term_ox = 0;
+int32_t g_term_oy = 0;
 uint32_t g_term_max_cols = 80;
 uint32_t g_term_max_rows = 24;
 uint32_t g_term_buf_height = 0;   // virtual backbuffer pixel height
@@ -299,11 +299,6 @@ volatile uint64_t g_idle_tsc_accum = 0;
 volatile uint64_t g_tick_count = 0;
 volatile bool g_needs_refresh = true;
 volatile bool g_desktop_ready = false;
-volatile bool wm_chrome_dirty = false;
-volatile bool g_dragging_test = false;
-volatile bool g_dragging_term = false;
-volatile bool g_dragging_rain = false;
-volatile bool g_dragging_log  = false;
 volatile uint32_t g_mouse_btns_prev = 0;
 
 #include "mouse.h"
@@ -349,10 +344,13 @@ extern "C" void mouse_process_scroll(int8_t scroll_dy) {
     if (!fb) return;
     int32_t mx = g_mouse_x, my = g_mouse_y;
     int idx = wm_find_top_window(mx, my);
-    if (idx == WIN_TERM) {
-        term_scroll_view(scroll_dy);
-    } else if (idx == WIN_LOG) {
-        wm_log_scroll(scroll_dy);
+    if (idx != -1) {
+        Window* win = g_window_list[idx];
+        if (win->is_system && win->type == WIN_TYPE_TERM) {
+            term_scroll_view(scroll_dy);
+        } else if (win->is_system && win->type == WIN_TYPE_LOG) {
+            wm_log_scroll(scroll_dy);
+        }
     }
 }
 
@@ -383,109 +381,63 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
         // Taskbar / Start button
         if (my >= (int32_t)fb->height - (int32_t)g_taskbar_h) {
             if (mx >= 6 && mx <= (int32_t)(6 + g_sb_w)) {
-                // Start button
                 term_clear_screen();
                 term_write_string((char*)"[SYSTEM] Start Menu coming soon...\r\n");
             } else {
-                // Task buttons — mirror the draw layout exactly
-                const int32_t WBTN_GAP = 4;
-                int32_t cur_x = 6 + g_sb_w + 10;  // sb_x + g_sb_w + gap
-                for (int idx = 0; idx < 4; idx++) {
-                    if (!g_win_visible[idx]) { continue; }
+                const int32_t WBTN_GAP = (int32_t)(4 * fb->height) / 1080;
+                int32_t cur_x = 6 + g_sb_w + (int32_t)(10 * fb->height) / 1080;
+                for (int i = 0; i < g_window_count; i++) {
+                    Window* win = g_window_list[i];
+                    if (!win || !win->visible) continue;
                     if (mx >= cur_x && mx < cur_x + (int32_t)g_wbtn_w) {
-                        wm_raise_window(idx);
+                        wm_raise_window(i);
                         break;
                     }
                     cur_x += g_wbtn_w + WBTN_GAP;
                 }
             }
-        }
- else {
+        } else {
             int idx = wm_find_top_window(mx, my);
             if (idx != -1) {
-                wm_raise_window(idx); // Move to top
+                wm_raise_window(idx);
+                Window* win = g_window_list[idx];
                 if (wm_is_in_close(idx, mx, my)) {
                     wm_close_window(idx);
                 } else if (wm_is_in_title(idx, mx, my)) {
-                    // Start dragging the topmost window
-                    if (idx == WIN_TERM) {
-                        wm_ghost_dragging_term = true; g_dragging_term = true;
-                        wm_drag_term_offx = mx - (int32_t)g_term_ox;
-                        wm_drag_term_offy = my - (int32_t)g_term_oy;
-                    } else if (idx == WIN_TEST) {
-                        wm_ghost_dragging_test = true; g_dragging_test = true;
-                        wm_drag_test_offx = mx - test_x;
-                        wm_drag_test_offy = my - test_y;
-                    } else if (idx == WIN_RAIN) {
-                        wm_ghost_dragging_rain = true; g_dragging_rain = true;
-                        wm_drag_rain_offx = mx - rain_x;
-                        wm_drag_rain_offy = my - rain_y;
-                    } else if (idx == WIN_LOG) {
-                        wm_ghost_dragging_log = true; g_dragging_log = true;
-                        wm_drag_log_offx = mx - log_win_x;
-                        wm_drag_log_offy = my - log_win_y;
-                    }
+                    win->ghost_dragging = true;
+                    win->ghost_x = win->x;
+                    win->ghost_y = win->y;
+                    win->drag_off_x = mx - win->x;
+                    win->drag_off_y = my - win->y;
                 }
             }
         }
     }
 
     // 3. Update ghost position while dragging (zero cost — just two int adds)
-    if (wm_ghost_dragging_term) {
-        wm_ghost_term_ox = g_mouse_x - wm_drag_term_offx;
-        wm_ghost_term_oy = g_mouse_y - wm_drag_term_offy;
-    }
-    if (wm_ghost_dragging_test) {
-        wm_ghost_test_ox = g_mouse_x - wm_drag_test_offx;
-        wm_ghost_test_oy = g_mouse_y - wm_drag_test_offy;
-    }
-    if (wm_ghost_dragging_rain) {
-        wm_ghost_rain_ox = g_mouse_x - wm_drag_rain_offx;
-        wm_ghost_rain_oy = g_mouse_y - wm_drag_rain_offy;
-    }
-    if (wm_ghost_dragging_log) {
-        wm_ghost_log_ox = g_mouse_x - wm_drag_log_offx;
-        wm_ghost_log_oy = g_mouse_y - wm_drag_log_offy;
+    for (int i = 0; i < g_window_count; i++) {
+        Window* win = g_window_list[i];
+        if (win && win->ghost_dragging) {
+            win->ghost_x = g_mouse_x - win->drag_off_x;
+            win->ghost_y = g_mouse_y - win->drag_off_y;
+        }
     }
 
-    // 4. Commit on release: NOW the window actually moves, triggering one recompose
     if (mouse_release) {
-        if (wm_ghost_dragging_term) {
-            g_term_ox = wm_ghost_term_ox;
-            g_term_oy = wm_ghost_term_oy;
-            wm_ghost_dragging_term = false;
-            g_dragging_term        = false;
-            // Full screen dirty: old location + new location both need repaint
-            g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
-            g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
-            g_needs_refresh = true;
-        }
-        if (wm_ghost_dragging_test) {
-            test_x = wm_ghost_test_ox;
-            test_y = wm_ghost_test_oy;
-            wm_ghost_dragging_test = false;
-            g_dragging_test        = false;
-            g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
-            g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
-            g_needs_refresh = true;
-        }
-        if (wm_ghost_dragging_rain) {
-            rain_x = wm_ghost_rain_ox;
-            rain_y = wm_ghost_rain_oy;
-            wm_ghost_dragging_rain = false;
-            g_dragging_rain        = false;
-            g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
-            g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
-            g_needs_refresh = true;
-        }
-        if (wm_ghost_dragging_log) {
-            log_win_x = wm_ghost_log_ox;
-            log_win_y = wm_ghost_log_oy;
-            wm_ghost_dragging_log = false;
-            g_dragging_log        = false;
-            g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
-            g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
-            g_needs_refresh = true;
+        for (int i = 0; i < g_window_count; i++) {
+            Window* win = g_window_list[i];
+            if (win && win->ghost_dragging) {
+                win->x = win->ghost_x;
+                win->y = win->ghost_y;
+                if (win->is_system && win->type == WIN_TYPE_TERM) {
+                    g_term_ox = win->x;
+                    g_term_oy = win->y;
+                }
+                win->ghost_dragging = false;
+                g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
+                g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+                g_needs_refresh = true;
+            }
         }
     }
 }
@@ -503,8 +455,11 @@ void compositor_thread_main() {
         uint64_t now_refresh = rdtsc();
         
         // If rainbow window is visible, always force a refresh for animation
-        if (g_win_visible[WIN_RAIN]) {
-            g_needs_refresh = true;
+        for (int i = 0; i < g_window_count; i++) {
+            if (g_window_list[i] && g_window_list[i]->visible && g_window_list[i]->type == WIN_TYPE_RAIN) {
+                g_needs_refresh = true;
+                break;
+            }
         }
 
         // Periodic HUD update: ensure Core0 stats refresh every 1 second
@@ -526,19 +481,22 @@ void compositor_thread_main() {
             // Drain and render any pending terminal output
             term_process_ring_buffer();
 
-            // Drive rainbow animation: 4 pixels per frame (rock solid now)
-            if (g_win_visible[WIN_RAIN]) {
-                rain_scroll += 4;
-                // Mark rainbow area as dirty
-                extern int32_t rain_x, rain_y, rain_w, rain_h;
-                uint32_t rx1 = (uint32_t)rain_x, rx2 = (uint32_t)(rain_x + rain_w);
-                uint32_t ry1 = (uint32_t)(rain_y - 28), ry2 = (uint32_t)(rain_y + rain_h);
-                if (rx1 < g_dirty_min_x) g_dirty_min_x = rx1;
-                if (rx2 > g_dirty_max_x) g_dirty_max_x = rx2;
-                if (ry1 < g_dirty_min_y) g_dirty_min_y = ry1;
-                if (ry2 > g_dirty_max_y) g_dirty_max_y = ry2;
+            Window* rain_win = nullptr;
+            for (int i = 0; i < g_window_count; i++) {
+                if (g_window_list[i] && g_window_list[i]->visible && g_window_list[i]->type == WIN_TYPE_RAIN) {
+                    rain_win = g_window_list[i];
+                    break;
+                }
             }
-            bool animation_active = g_win_visible[WIN_RAIN]; 
+
+            if (rain_win) {
+                rain_scroll += 4;
+                WinRect r; wm_get_win_rect(rain_win, &r);
+                if (r.x1 >= 0 && (uint32_t)r.x1 < g_dirty_min_x) g_dirty_min_x = (uint32_t)r.x1;
+                if (r.x2 >= 0 && (uint32_t)r.x2 > g_dirty_max_x) g_dirty_max_x = (uint32_t)r.x2;
+                if (r.y1 >= 0 && (uint32_t)r.y1 < g_dirty_min_y) g_dirty_min_y = (uint32_t)r.y1;
+                if (r.y2 >= 0 && (uint32_t)r.y2 > g_dirty_max_y) g_dirty_max_y = (uint32_t)r.y2;
+            }
 
             __asm__ volatile("cli");
             uint32_t fx1 = g_dirty_min_x, fx2 = g_dirty_max_x;
@@ -553,18 +511,12 @@ void compositor_thread_main() {
                 boot_sync_frames--;
             }
             
-            // If animating, only dirty the rainbow window region to save bandwidth.
-            if (animation_active) {
-                uint32_t rx1 = rain_x > 0 ? (uint32_t)rain_x : 0;
-                uint32_t rx2 = (uint32_t)(rain_x + rain_w);
-                int32_t  ry1_s = rain_y - 28;
-                uint32_t ry1 = ry1_s > 0 ? (uint32_t)ry1_s : 0;
-                uint32_t ry2 = (uint32_t)(rain_y + rain_h);
-                
-                if (rx1 < fx1) fx1 = rx1;
-                if (rx2 > fx2) fx2 = rx2;
-                if (ry1 < fy1) fy1 = ry1;
-                if (ry2 > fy2) fy2 = ry2;
+            if (rain_win) {
+                WinRect r; wm_get_win_rect(rain_win, &r);
+                if (r.x1 >= 0 && (uint32_t)r.x1 < fx1) fx1 = (uint32_t)r.x1;
+                if (r.x2 >= 0 && (uint32_t)r.x2 > fx2) fx2 = (uint32_t)r.x2;
+                if (r.y1 >= 0 && (uint32_t)r.y1 < fy1) fy1 = (uint32_t)r.y1;
+                if (r.y2 >= 0 && (uint32_t)r.y2 > fy2) fy2 = (uint32_t)r.y2;
             }
 
             uint64_t t_start = rdtsc();

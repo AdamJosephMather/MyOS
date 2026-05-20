@@ -60,6 +60,7 @@
 #include "vfs.h"
 #include "tty.h"
 #include "acpi.h"
+#include "wm.h"
 
 // ── MSR addresses ─────────────────────────────────────────────────────────────
 
@@ -102,6 +103,11 @@ extern uint64_t g_saved_user_rsp;
 #define SYS_EXIT    60u
 #define SYS_SHUTDOWN 88u
 #define SYS_REBOOT   169u
+
+#define SYS_WIN_CREATE    200u
+#define SYS_WIN_SYNC      201u
+#define SYS_WIN_DESTROY   202u
+#define SYS_WIN_GET_BUFFER 203u
 
 // ── string copying from user ──────────────────────────────────────────────────
 // For safety we should check if buf_va is within user limits.
@@ -250,11 +256,43 @@ static uint64_t sys_ttyraw(uint64_t raw) {
     return 0;
 }
 
+// ── sys_win_create ────────────────────────────────────────────────────────────
+static uint64_t sys_win_create(uint64_t title_va, uint64_t x, uint64_t y, uint64_t w, uint64_t h, uint64_t flags) {
+    char title[64];
+    copy_string_from_user(title, title_va, sizeof(title));
+    bool closable = (flags & 1);
+    Window* win = wm_create_window(title, (int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h, closable);
+    if (!win) return 0;
+    return (uint64_t)win->id;
+}
+
+// ── sys_win_sync ──────────────────────────────────────────────────────────────
+static uint64_t sys_win_sync(uint64_t win_id) {
+    g_needs_refresh = true;
+    return 0;
+}
+
+// ── sys_win_destroy ───────────────────────────────────────────────────────────
+static uint64_t sys_win_destroy(uint64_t win_id) {
+    wm_destroy_window((int)win_id);
+    return 0;
+}
+
+// ── sys_win_get_buffer ────────────────────────────────────────────────────────
+static uint64_t sys_win_get_buffer(uint64_t win_id) {
+    for (int i = 0; i < g_window_count; i++) {
+        if (g_window_list[i] && g_window_list[i]->id == (int)win_id) {
+            return (uint64_t)g_window_list[i]->buffer;
+        }
+    }
+    return 0;
+}
+
 // ── syscall_dispatch ──────────────────────────────────────────────────────────
 // Called from the naked entry stub.  Returns the value to place in RAX.
 
 extern "C" __attribute__((used))
-uint64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t user_rip, uint64_t user_rflags) {
+uint64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     switch (nr) {
         case SYS_READ:   return sys_read(a1, a2, a3);
         case SYS_WRITE:  return sys_write(a1, a2, a3);
@@ -266,6 +304,12 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, ui
         case SYS_EXIT:   sys_exit(a1);
         case SYS_SHUTDOWN: return sys_shutdown();
         case SYS_REBOOT:   hardware_reset(); return 0;
+        
+        case SYS_WIN_CREATE: return sys_win_create(a1, a2, a3, a4, a5, 0); // 6th arg flags omitted for now or added
+        case SYS_WIN_SYNC:   return sys_win_sync(a1);
+        case SYS_WIN_DESTROY: return sys_win_destroy(a1);
+        case SYS_WIN_GET_BUFFER: return sys_win_get_buffer(a1);
+        
         default:         return (uint64_t)-1;
     }
 }
@@ -313,10 +357,10 @@ __asm__ (
     "pushq %r12\n"
 
     // 4. Pass arguments to C++ dispatcher.
-    // nr:RAX -> RDI, a1:RDI -> RSI, a2:RSI -> RDX, a3:RDX -> RCX
-    // rip:RCX -> R8, rflags:R11 -> R9
-    "movq %r11, %r9\n"
-    "movq %rcx, %r8\n"
+    // nr:RAX -> RDI
+    // a1:RDI -> RSI, a2:RSI -> RDX, a3:RDX -> RCX, a4:R10 -> R8, a5:R8 -> R9
+    "movq %r8,  %r9\n"
+    "movq %r10, %r8\n"
     "movq %rdx, %rcx\n"
     "movq %rsi, %rdx\n"
     "movq %rdi, %rsi\n"

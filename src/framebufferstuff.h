@@ -22,11 +22,7 @@ extern int32_t g_term_oy;        // terminal window Y offset
 extern uint32_t g_term_max_cols;  // terminal character width
 extern uint32_t g_term_max_rows;  // terminal row height
 extern volatile bool g_needs_refresh;
-extern volatile bool wm_chrome_dirty;
-extern volatile bool g_dragging_test;
-extern volatile bool g_dragging_term;
-extern volatile bool g_dragging_log;
-static inline void wm_dirty_chrome() { wm_chrome_dirty = true; g_needs_refresh = true; }
+static inline void wm_dirty_chrome() { g_needs_refresh = true; }
 
 
 static inline void term_dirty_rect(int32_t x1, int32_t y1, int32_t x2, int32_t y2) {

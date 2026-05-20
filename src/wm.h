@@ -23,11 +23,40 @@ extern uint64_t tsc_hz;
 extern volatile uint64_t g_idle_tsc_accum;
 extern uint64_t g_last_frame_ticks;
 
+extern uint32_t g_term_max_cols, g_term_max_rows;
+
+struct WinRect {
+    int32_t x1, y1, x2, y2;
+    bool visible;
+};
+
 static uint64_t g_time_bg_ticks = 0;
 static uint64_t g_time_win_ticks = 0;
 static uint64_t g_time_rain_ticks = 0;
 static uint64_t g_time_lock_ticks = 0;
 static uint64_t g_time_vram_ticks = 0;
+
+struct Window {
+    int id;
+    char title[64];
+    int32_t x, y, w, h;
+    uint32_t* buffer;
+    uint32_t buffer_pitch;
+    bool visible;
+    bool closable;
+    bool is_system; // If true, handled specially (e.g. Terminal, Rain)
+    int type;      // For system windows
+    bool ghost_dragging;
+    int32_t ghost_x, ghost_y;
+    int32_t drag_off_x, drag_off_y;
+    int32_t last_ghost_fx, last_ghost_fy, last_ghost_fw, last_ghost_fh;
+    bool last_ghost_active;
+};
+
+#define MAX_WINDOWS 32
+static Window* g_window_list[MAX_WINDOWS];
+static int     g_window_order[MAX_WINDOWS];
+static int     g_window_count = 0;
 
 static uint32_t g_title_h = 28;
 static uint32_t g_border  = 2;
@@ -35,16 +64,14 @@ static uint32_t g_pad     = 2;
 #define CURSOR_W    12
 #define CURSOR_H    19
 
-#define WIN_TERM 0
-#define WIN_TEST 1
-#define WIN_RAIN 2
-#define WIN_LOG  3
+#define WIN_TYPE_TERM 0
+#define WIN_TYPE_TEST 1
+#define WIN_TYPE_RAIN 2
+#define WIN_TYPE_LOG  3
+#define WIN_TYPE_USER 10
 
-static int  g_win_order[4]   = {WIN_TERM, WIN_TEST, WIN_RAIN, WIN_LOG};
-static bool g_win_visible[4] = {true, true, true, true};
-
-static int32_t  test_x = 450, test_y = 120, test_w = 800, test_h = 600;
-static int32_t  rain_x = 150, rain_y = 420, rain_w = 800, rain_h = 600;
+static uint32_t test_w, test_h;
+static uint32_t rain_w, rain_h;
 static uint32_t rain_scroll = 0;
 static uint32_t g_rainbow_lut[360];
 static uint32_t wm_win_x, wm_win_y, wm_win_w, wm_win_h;
@@ -209,12 +236,82 @@ static uint32_t g_log_stride = 800;
 static uint32_t g_font_scale_100 = 100;
 #define LOG_CHAR_W    8
 #define LOG_CHAR_H    10
-static int32_t  log_win_x = 20, log_win_y = 80;
 static int32_t  log_win_scroll = 0; // rows scrolled up (positive = older content)
 static char     g_log_buf[LOG_WIN_LINES][LOG_WIN_COLS + 1];
 static uint32_t g_log_line_count = 0;
 static uint32_t* g_log_win_backbuffer = nullptr;
 static int32_t  log_last_rendered_scroll = -1;
+
+static inline void ghost_term_frame(int32_t ox, int32_t oy,
+                                     int32_t* fx, int32_t* fy,
+                                     int32_t* fw, int32_t* fh) {
+    uint32_t content_w = g_term_max_cols * 8;
+    uint32_t content_h = g_term_max_rows * 10;
+    *fx = ox - (int32_t)(g_border + g_pad);
+    *fy = oy - (int32_t)(g_title_h + g_border + g_pad);
+    *fw = (int32_t)content_w + (int32_t)(g_border + g_pad) * 2;
+    *fh = (int32_t)content_h + (int32_t)(g_border * 2 + g_title_h + g_pad * 2);
+}
+
+static inline void ghost_test_frame(int32_t ox, int32_t oy,
+                                     int32_t* fx, int32_t* fy,
+                                     int32_t* fw, int32_t* fh) {
+    *fx = ox; *fy = oy - (int32_t)g_title_h; *fw = test_w; *fh = test_h + (int32_t)g_title_h;
+}
+
+static inline void ghost_rain_frame(int32_t ox, int32_t oy,
+                                     int32_t* fx, int32_t* fy,
+                                     int32_t* fw, int32_t* fh) {
+    *fx = ox; *fy = oy - (int32_t)g_title_h; *fw = rain_w; *fh = rain_h + (int32_t)g_title_h;
+}
+
+static inline void ghost_log_frame(int32_t ox, int32_t oy,
+                                     int32_t* fx, int32_t* fy,
+                                     int32_t* fw, int32_t* fh) {
+    int32_t lw = (int32_t)g_log_win_cols * LOG_CHAR_W;
+    int32_t lh = (int32_t)g_log_rows_visible * LOG_CHAR_H;
+    *fx = ox - (int32_t)(g_border + g_pad);
+    *fy = oy - (int32_t)(g_title_h + g_border + g_pad);
+    *fw = lw + (int32_t)(g_border + g_pad) * 2;
+    *fh = lh + (int32_t)(g_border * 2 + g_title_h + g_pad * 2);
+}
+
+static inline void wm_get_win_rect(Window* win, WinRect* r) {
+    r->visible = win->visible;
+    if (win->is_system && win->type == WIN_TYPE_TERM) {
+        uint32_t wx = win->x, wy = win->y;
+        uint32_t ww = g_term_max_cols * 8, wh = g_term_max_rows * 10;
+        r->x1 = (wx > (uint32_t)(g_border + g_pad)) ? wx - g_border - g_pad : 0;
+        r->x2 = wx + ww + g_border + g_pad;
+        r->y1 = (wy > (uint32_t)(g_border + g_title_h + g_pad)) ? (int32_t)(wy - g_border - g_title_h - g_pad) : 0;
+        r->y2 = (int32_t)(wy + wh + g_border + g_pad);
+    } else if (win->is_system && win->type == WIN_TYPE_LOG) {
+        int32_t lw = (int32_t)g_log_win_cols * LOG_CHAR_W;
+        int32_t lh = (int32_t)g_log_rows_visible * LOG_CHAR_H; 
+        r->x1 = win->x - (int32_t)(g_border + g_pad);
+        r->y1 = win->y - (int32_t)(g_title_h + g_border + g_pad);
+        r->x2 = win->x + lw + (int32_t)(g_border + g_pad);
+        r->y2 = win->y + lh + (int32_t)(g_border + g_pad);
+    } else {
+        r->x1 = win->x; r->y1 = win->y - (int32_t)g_title_h;
+        r->x2 = win->x + (int32_t)win->w; r->y2 = win->y + (int32_t)win->h;
+    }
+}
+
+static inline void wm_get_win_rect_from_pos(Window* win, int32_t x, int32_t y, int32_t* fx, int32_t* fy, int32_t* fw, int32_t* fh) {
+    if (win->is_system && win->type == WIN_TYPE_TERM) {
+        ghost_term_frame(x, y, fx, fy, fw, fh);
+    } else if (win->is_system && win->type == WIN_TYPE_LOG) {
+        ghost_log_frame(x, y, fx, fy, fw, fh);
+    } else if (win->is_system && win->type == WIN_TYPE_RAIN) {
+        ghost_rain_frame(x, y, fx, fy, fw, fh);
+    } else if (win->is_system && win->type == WIN_TYPE_TEST) {
+        ghost_test_frame(x, y, fx, fy, fw, fh);
+    } else {
+        *fx = x; *fy = y - (int32_t)g_title_h;
+        *fw = win->w; *fh = win->h + (int32_t)g_title_h;
+    }
+}
 
 static void wm_log_render_line_to_buffer(int32_t line_idx, int32_t buffer_row) {
     if (!g_log_win_backbuffer) return;
@@ -326,15 +423,16 @@ void wm_log_append(const char* s) {
 
     // 5. Mark regions dirty
     g_needs_refresh = true;
-    if (fb) {
-        uint32_t lx1 = (uint32_t)(log_win_x > 0 ? log_win_x - 4 : 0);
-        uint32_t lx2 = (uint32_t)(log_win_x + g_log_win_cols * LOG_CHAR_W + 8);
-        uint32_t ly1 = (uint32_t)(log_win_y > 32 ? log_win_y - 32 : 0);
-        uint32_t ly2 = (uint32_t)(log_win_y + g_log_rows_visible * LOG_CHAR_H + 8);
-        if (lx1 < g_dirty_min_x) g_dirty_min_x = lx1;
-        if (lx2 > g_dirty_max_x) g_dirty_max_x = lx2;
-        if (ly1 < g_dirty_min_y) g_dirty_min_y = ly1;
-        if (ly2 > g_dirty_max_y) g_dirty_max_y = ly2;
+    for (int i = 0; i < g_window_count; i++) {
+        Window* win = g_window_list[i];
+        if (win && win->type == WIN_TYPE_LOG) {
+            WinRect r; wm_get_win_rect(win, &r);
+            if (r.x1 >= 0 && (uint32_t)r.x1 < g_dirty_min_x) g_dirty_min_x = (uint32_t)r.x1;
+            if (r.x2 >= 0 && (uint32_t)r.x2 > g_dirty_max_x) g_dirty_max_x = (uint32_t)r.x2;
+            if (r.y1 >= 0 && (uint32_t)r.y1 < g_dirty_min_y) g_dirty_min_y = (uint32_t)r.y1;
+            if (r.y2 >= 0 && (uint32_t)r.y2 > g_dirty_max_y) g_dirty_max_y = (uint32_t)r.y2;
+            break;
+        }
     }
 }
 
@@ -349,51 +447,20 @@ static void wm_log_scroll(int delta) {
     wm_log_render_to_buffer();
 
     // Mark log window area dirty
-    if (fb) {
-        uint32_t lx1 = (uint32_t)(log_win_x > 0 ? log_win_x - 4 : 0);
-        uint32_t lx2 = (uint32_t)(log_win_x + LOG_WIN_COLS * LOG_CHAR_W + 8);
-        uint32_t ly1 = (uint32_t)(log_win_y > 32 ? log_win_y - 32 : 0);
-        uint32_t ly2 = (uint32_t)(log_win_y + LOG_WIN_ROWS_VISIBLE * LOG_CHAR_H + 8);
-        if (lx1 < g_dirty_min_x) g_dirty_min_x = lx1;
-        if (lx2 > g_dirty_max_x) g_dirty_max_x = lx2;
-        if (ly1 < g_dirty_min_y) g_dirty_min_y = ly1;
-        if (ly2 > g_dirty_max_y) g_dirty_max_y = ly2;
-        g_needs_refresh = true;
+    for (int i = 0; i < g_window_count; i++) {
+        Window* win = g_window_list[i];
+        if (win && win->type == WIN_TYPE_LOG) {
+            WinRect r; wm_get_win_rect(win, &r);
+            if (r.x1 >= 0 && (uint32_t)r.x1 < g_dirty_min_x) g_dirty_min_x = (uint32_t)r.x1;
+            if (r.x2 >= 0 && (uint32_t)r.x2 > g_dirty_max_x) g_dirty_max_x = (uint32_t)r.x2;
+            if (r.y1 >= 0 && (uint32_t)r.y1 < g_dirty_min_y) g_dirty_min_y = (uint32_t)r.y1;
+            if (r.y2 >= 0 && (uint32_t)r.y2 > g_dirty_max_y) g_dirty_max_y = (uint32_t)r.y2;
+            break;
+        }
     }
+    g_needs_refresh = true;
 }
 
-extern int32_t g_term_ox, g_term_oy;
-extern uint32_t g_term_max_cols, g_term_max_rows;
-
-struct WinRect {
-    int32_t x1, y1, x2, y2;
-    bool visible;
-};
-
-static inline void get_win_rect(int idx, WinRect* r) {
-    r->visible = g_win_visible[idx];
-    if (idx == WIN_TERM) {
-        uint32_t wx = g_term_ox, wy = g_term_oy;
-        uint32_t ww = g_term_max_cols * 8, wh = g_term_max_rows * 10;
-        r->x1 = (wx > (uint32_t)(g_border + g_pad)) ? wx - g_border - g_pad : 0;
-        r->x2 = wx + ww + g_border + g_pad;
-        r->y1 = (wy > (uint32_t)(g_border + g_title_h + g_pad)) ? (int32_t)(wy - g_border - g_title_h - g_pad) : 0;
-        r->y2 = (int32_t)(wy + wh + g_border + g_pad);
-    } else if (idx == WIN_TEST) {
-        r->x1 = test_x; r->y1 = test_y - (int32_t)g_title_h;
-        r->x2 = test_x + (int32_t)test_w; r->y2 = test_y + (int32_t)test_h;
-    } else if (idx == WIN_RAIN) {
-        r->x1 = rain_x; r->y1 = rain_y - (int32_t)g_title_h;
-        r->x2 = rain_x + (int32_t)rain_w; r->y2 = rain_y + (int32_t)rain_h;
-    } else if (idx == WIN_LOG) {
-        int32_t lw = (int32_t)g_log_win_cols * LOG_CHAR_W;
-        int32_t lh = (int32_t)g_log_rows_visible * LOG_CHAR_H; 
-        r->x1 = log_win_x - (int32_t)(g_border + g_pad);
-        r->y1 = log_win_y - (int32_t)(g_title_h + g_border + g_pad);
-        r->x2 = log_win_x + lw + (int32_t)(g_border + g_pad);
-        r->y2 = log_win_y + lh + (int32_t)(g_border + g_pad);
-    }
-}
 
 static inline void wm_draw_char(uint32_t x, uint32_t y, char c, uint32_t color, uint32_t scale_100 = 100) {
     if (!g_master_backbuffer || (uint32_t)c > 127) return;
@@ -500,31 +567,6 @@ static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_
 
 // Currently live on VRAM beyond master_backbuffer:
 static int32_t ov_cx = -999, ov_cy = -999;
-static bool    ov_ghost_term = false;
-static int32_t ov_gt_x, ov_gt_y, ov_gt_w, ov_gt_h;
-static bool    ov_ghost_test = false;
-static int32_t ov_gs_x, ov_gs_y, ov_gs_w, ov_gs_h;
-static bool    ov_ghost_rain = false;
-static int32_t ov_gr_x, ov_gr_y, ov_gr_w, ov_gr_h;
-static bool    ov_ghost_log  = false;
-static int32_t ov_gl_x, ov_gl_y, ov_gl_w, ov_gl_h;
-
-// Ghost drag: pending destination while LMB is held on a title bar.
-// The real g_term_ox/oy don't change until mouse release — the window
-// stays at its original position in master_backbuffer. Only the outline moves.
-// This is the classic Win3.1 / X11 "move outline" mode.
-static bool    wm_ghost_dragging_term  = false;
-static bool    wm_ghost_dragging_test  = false;
-static bool    wm_ghost_dragging_rain  = false;
-static bool    wm_ghost_dragging_log   = false;
-static int32_t wm_ghost_term_ox = 0, wm_ghost_term_oy = 0;
-static int32_t wm_ghost_test_ox = 0, wm_ghost_test_oy = 0;
-static int32_t wm_ghost_rain_ox = 0, wm_ghost_rain_oy = 0;
-static int32_t wm_ghost_log_ox = 0, wm_ghost_log_oy = 0;
-static int32_t wm_drag_term_offx = 0, wm_drag_term_offy = 0;
-static int32_t wm_drag_test_offx = 0, wm_drag_test_offy = 0;
-static int32_t wm_drag_rain_offx = 0, wm_drag_rain_offy = 0;
-static int32_t wm_drag_log_offx = 0, wm_drag_log_offy = 0;
 
 // ─── Low-level VRAM helpers ──────────────────────────────────────────────────
 
@@ -720,40 +762,126 @@ static inline void vram_draw_cursor(int32_t mx, int32_t my, uint8_t mb) {
 
 // ─── Ghost frame geometry ────────────────────────────────────────────────────
 
-static inline void ghost_term_frame(int32_t ox, int32_t oy,
-                                     int32_t* fx, int32_t* fy,
-                                     int32_t* fw, int32_t* fh) {
-    uint32_t content_w = g_term_max_cols * 8;
-    uint32_t content_h = g_term_max_rows * 10;
-    *fx = ox - (int32_t)(g_border + g_pad);
-    *fy = oy - (int32_t)(g_title_h + g_border + g_pad);
-    *fw = (int32_t)content_w + (int32_t)(g_border + g_pad) * 2;
-    *fh = (int32_t)content_h + (int32_t)(g_border * 2 + g_title_h + g_pad * 2);
+static inline int wm_find_top_window(int32_t mx, int32_t my) {
+    for (int s = g_window_count - 1; s >= 0; s--) {
+        int idx = g_window_order[s];
+        Window* win = g_window_list[idx];
+        if (!win || !win->visible) continue;
+        WinRect r; wm_get_win_rect(win, &r);
+        if (mx >= r.x1 && mx < r.x2 && my >= r.y1 && my < r.y2) return idx;
+    }
+    return -1;
 }
 
-static inline void ghost_test_frame(int32_t ox, int32_t oy,
-                                     int32_t* fx, int32_t* fy,
-                                     int32_t* fw, int32_t* fh) {
-    *fx = ox; *fy = oy - (int32_t)g_title_h; *fw = test_w; *fh = test_h + (int32_t)g_title_h;
+static inline void wm_raise_window(int idx) {
+    int old_pos = -1;
+    for (int i = 0; i < g_window_count; i++) if (g_window_order[i] == idx) old_pos = i;
+    if (old_pos == -1 || old_pos == g_window_count - 1) return;
+    for (int i = old_pos; i < g_window_count - 1; i++) g_window_order[i] = g_window_order[i+1];
+    g_window_order[g_window_count - 1] = idx;
+    g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
+    g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+    g_needs_refresh = true;
 }
 
-static inline void ghost_rain_frame(int32_t ox, int32_t oy,
-                                     int32_t* fx, int32_t* fy,
-                                     int32_t* fw, int32_t* fh) {
-    *fx = ox; *fy = oy - (int32_t)g_title_h; *fw = rain_w; *fh = rain_h + (int32_t)g_title_h;
+static inline bool wm_is_in_title(int idx, int32_t mx, int32_t my) {
+    if (idx < 0 || idx >= g_window_count) return false;
+    Window* win = g_window_list[idx];
+    WinRect r; wm_get_win_rect(win, &r);
+    return (mx >= r.x1 && mx < r.x2 && my >= r.y1 && my < r.y1 + (int32_t)g_title_h);
 }
 
-static inline void ghost_log_frame(int32_t ox, int32_t oy,
-                                     int32_t* fx, int32_t* fy,
-                                     int32_t* fw, int32_t* fh) {
-    int32_t lw = (int32_t)g_log_win_cols * LOG_CHAR_W;
-    int32_t lh = (int32_t)g_log_rows_visible * LOG_CHAR_H;
-    *fx = ox - (int32_t)(g_border + g_pad);
-    *fy = oy - (int32_t)(g_title_h + g_border + g_pad);
-    *fw = lw + (int32_t)(g_border + g_pad) * 2;
-    *fh = lh + (int32_t)(g_border * 2 + g_title_h + g_pad * 2);
+static inline bool wm_is_in_close(int idx, int32_t mx, int32_t my) {
+    if (idx < 0 || idx >= g_window_count) return false;
+    Window* win = g_window_list[idx];
+    WinRect r; wm_get_win_rect(win, &r);
+    
+    int32_t w = r.x2 - r.x1;
+    int32_t btn_pad = (int32_t)(4 * g_title_h) / 42;
+    if (btn_pad < 2) btn_pad = 2;
+    int32_t btn_h = (int32_t)g_title_h - btn_pad * 2;
+    int32_t btn_w = btn_h;
+    int32_t btn_x = r.x1 + w - btn_w - btn_pad;
+    int32_t btn_y = r.y1 + btn_pad;
+    
+    return (mx >= btn_x && mx < btn_x + btn_w && my >= btn_y && my < btn_y + btn_h);
 }
 
+static inline void wm_close_window(int idx) {
+    if (idx < 0 || idx >= g_window_count) return;
+    Window* win = g_window_list[idx];
+    if (win->is_system && win->type == WIN_TYPE_TERM) return; // Terminal is immortal
+    win->visible = false;
+    g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
+    g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+    g_needs_refresh = true;
+}
+
+static int g_next_win_id = 1;
+
+static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, int32_t w, int32_t h, bool closable, bool is_system = false, int type = WIN_TYPE_USER) {
+    if (g_window_count >= MAX_WINDOWS) return nullptr;
+    
+    Window* win = (Window*)kmalloc(sizeof(Window));
+    if (!win) return nullptr;
+    memset(win, 0, sizeof(Window));
+    
+    win->id = g_next_win_id++;
+    uint32_t i = 0;
+    while (title[i] && i < 63) { win->title[i] = title[i]; i++; }
+    win->title[i] = '\0';
+    
+    win->x = x; win->y = y; win->w = w; win->h = h;
+    win->closable = closable;
+    win->visible = true;
+    win->is_system = is_system;
+    win->type = type;
+    
+    if (!is_system) {
+        win->buffer = (uint32_t*)kmalloc((uint64_t)w * h * 4);
+        if (win->buffer) memset(win->buffer, 0, (uint64_t)w * h * 4);
+        win->buffer_pitch = w * 4;
+    } else {
+        win->buffer = nullptr;
+        win->buffer_pitch = 0;
+    }
+    
+    int idx = g_window_count;
+    g_window_list[idx] = win;
+    g_window_order[idx] = idx;
+    g_window_count++;
+    
+    g_needs_refresh = true;
+    return win;
+}
+
+static inline void wm_destroy_window(int id) {
+    int idx = -1;
+    for (int i = 0; i < g_window_count; i++) {
+        if (g_window_list[i] && g_window_list[i]->id == id) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == -1) return;
+    
+    Window* win = g_window_list[idx];
+    if (win->buffer) kfree(win->buffer);
+    kfree(win);
+    g_window_list[idx] = nullptr;
+    
+    for (int i = idx; i < g_window_count - 1; i++) g_window_list[i] = g_window_list[i+1];
+    g_window_list[g_window_count - 1] = nullptr;
+    
+    int order_idx = -1;
+    for (int i = 0; i < g_window_count; i++) if (g_window_order[i] == idx) order_idx = i;
+    if (order_idx != -1) {
+        for (int i = order_idx; i < g_window_count - 1; i++) g_window_order[i] = g_window_order[i+1];
+        for (int i = 0; i < g_window_count - 1; i++) if (g_window_order[i] > idx) g_window_order[i]--;
+    }
+    g_window_count--;
+    g_needs_refresh = true;
+}
 
 // =============================================================================
 //  wm_overlay_update — called on EVERY mouse event (no compositor involved)
@@ -773,52 +901,22 @@ static inline void wm_overlay_update_unlocked(int32_t new_cx, int32_t new_cy, ui
     vram_restore_rect(ov_cx - 1, ov_cy - 1,
                       ov_cx + CURSOR_W + 1, ov_cy + CURSOR_H + 1);
 
-    // ── Terminal ghost: atomic erase-old + draw-new in one pass ─────────────
-    {
+    for (int i = 0; i < g_window_count; i++) {
+        Window* win = g_window_list[i];
+        if (!win) continue;
+        
         int32_t nfx = 0, nfy = 0, nfw = 0, nfh = 0;
-        bool dn = wm_ghost_dragging_term;
-        if (dn) ghost_term_frame(wm_ghost_term_ox, wm_ghost_term_oy,
-                                 &nfx, &nfy, &nfw, &nfh);
-        vram_transition_outline(ov_gt_x, ov_gt_y, ov_gt_w, ov_gt_h, ov_ghost_term,
+        bool dn = win->ghost_dragging;
+        if (dn) wm_get_win_rect_from_pos(win, win->ghost_x, win->ghost_y, &nfx, &nfy, &nfw, &nfh);
+        
+        vram_transition_outline(win->last_ghost_fx, win->last_ghost_fy, win->last_ghost_fw, win->last_ghost_fh, win->last_ghost_active,
                                 nfx,     nfy,     nfw,     nfh,     dn);
-        ov_ghost_term = dn;
-        if (dn) { ov_gt_x = nfx; ov_gt_y = nfy; ov_gt_w = nfw; ov_gt_h = nfh; }
-    }
-
-    // ── Test ghost: same treatment ───────────────────────────────────────────
-    {
-        int32_t nfx = 0, nfy = 0, nfw = 0, nfh = 0;
-        bool dn = wm_ghost_dragging_test;
-        if (dn) ghost_test_frame(wm_ghost_test_ox, wm_ghost_test_oy,
-                                 &nfx, &nfy, &nfw, &nfh);
-        vram_transition_outline(ov_gs_x, ov_gs_y, ov_gs_w, ov_gs_h, ov_ghost_test,
-                                nfx,     nfy,     nfw,     nfh,     dn);
-        ov_ghost_test = dn;
-        if (dn) { ov_gs_x = nfx; ov_gs_y = nfy; ov_gs_w = nfw; ov_gs_h = nfh; }
-    }
-
-    // ── Rainbow ghost ────────────────────────────────────────────────────────
-    {
-        int32_t nfx = 0, nfy = 0, nfw = 0, nfh = 0;
-        bool dn = wm_ghost_dragging_rain;
-        if (dn) ghost_rain_frame(wm_ghost_rain_ox, wm_ghost_rain_oy,
-                                 &nfx, &nfy, &nfw, &nfh);
-        vram_transition_outline(ov_gr_x, ov_gr_y, ov_gr_w, ov_gr_h, ov_ghost_rain,
-                                nfx,     nfy,     nfw,     nfh,     dn);
-        ov_ghost_rain = dn;
-        if (dn) { ov_gr_x = nfx; ov_gr_y = nfy; ov_gr_w = nfw; ov_gr_h = nfh; }
-    }
-
-    // ── Log ghost ────────────────────────────────────────────────────────────
-    {
-        int32_t nfx = 0, nfy = 0, nfw = 0, nfh = 0;
-        bool dn = wm_ghost_dragging_log;
-        if (dn) ghost_log_frame(wm_ghost_log_ox, wm_ghost_log_oy,
-                                 &nfx, &nfy, &nfw, &nfh);
-        vram_transition_outline(ov_gl_x, ov_gl_y, ov_gl_w, ov_gl_h, ov_ghost_log,
-                                nfx,     nfy,     nfw,     nfh,     dn);
-        ov_ghost_log = dn;
-        if (dn) { ov_gl_x = nfx; ov_gl_y = nfy; ov_gl_w = nfw; ov_gl_h = nfh; }
+                                
+        win->last_ghost_active = dn;
+        if (dn) {
+            win->last_ghost_fx = nfx; win->last_ghost_fy = nfy;
+            win->last_ghost_fw = nfw; win->last_ghost_fh = nfh;
+        }
     }
 
     // Draw cursor on top of everything
@@ -839,8 +937,12 @@ static inline void wm_overlay_update(int32_t new_cx, int32_t new_cy, uint8_t mb)
 //  wm_init
 // =============================================================================
 static inline void wm_init() {
-    // 1080p Baseline: Laptop look is "Perfect" (1.0 scale)
-    // MASTER SCALE: Apply height ratio to EVERYTHING to preserve aspect ratio.
+    g_window_count = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        g_window_list[i] = nullptr;
+        g_window_order[i] = 0;
+    }
+
     uint32_t sn = fb->height;
     uint32_t sd = 1080;
 
@@ -849,7 +951,6 @@ static inline void wm_init() {
     g_border    = (sn * 3) / sd;
     g_pad       = (sn * 3) / sd;
     
-    // Font scaling (1x for 1080p, 1.5x for 2K, 2x for 4K)
     g_font_scale_100 = (sn >= 2160) ? 200 : (sn >= 1440) ? 150 : 100;
     
     if (g_taskbar_h < 30) g_taskbar_h = 30;
@@ -857,18 +958,14 @@ static inline void wm_init() {
     if (g_border < 1)     g_border = 1;
     if (g_pad < 1)        g_pad = 1;
     
-    // Horizontal elements use HEIGHT scale to maintain ratio
     g_sb_w   = (sn * 138) / sd;
     g_wbtn_w = (sn * 186) / sd;
     if (g_sb_w < 80)   g_sb_w = 80;
     if (g_wbtn_w < 110) g_wbtn_w = 110;
 
-    // Content-First Window Sizes (Perfect 800x600 at 1080p)
-    // 1. Calculate desired content area
     uint32_t desired_test_w = (sn * 800) / sd;
     uint32_t desired_test_h = (sn * 600) / sd;
 
-    // 2. Snap to cell multiples to eliminate grey borders
     g_term_max_cols = desired_test_w / 8;
     g_term_max_rows = desired_test_h / 10;
     if (g_term_max_cols < 40) g_term_max_cols = 40;
@@ -879,37 +976,35 @@ static inline void wm_init() {
     rain_w = test_w;
     rain_h = test_h;
 
-    // 3. Scale Scroll window content too (UNIFY with terminal)
     g_log_win_cols = g_term_max_cols;
     g_log_rows_visible = g_term_max_rows;
 
-    // Derived total window sizes
     wm_win_w = test_w + (g_border + g_pad) * 2;
     wm_win_h = test_h + g_border * 2 + g_title_h + g_pad * 2;
     
-    // Center it
     wm_win_x = (fb->width > wm_win_w) ? (fb->width - wm_win_w) / 2 : 0;
     wm_win_y = (fb->height > wm_win_h) ? (fb->height - wm_win_h) / 2 : 0;
 
-    g_term_ox = wm_win_x + g_border + g_pad;
-    g_term_oy = wm_win_y + g_border + g_title_h + g_pad;
+    int32_t tox = (int32_t)wm_win_x + (int32_t)(g_border + g_pad);
+    int32_t toy = (int32_t)wm_win_y + (int32_t)(g_border + g_title_h + g_pad);
 
-    wm_ghost_term_ox = (int32_t)g_term_ox;
-    wm_ghost_term_oy = (int32_t)g_term_oy;
-    wm_ghost_test_ox = test_x;
-    wm_ghost_test_oy = test_y;
-    wm_ghost_rain_ox = rain_x;
-    wm_ghost_rain_oy = rain_y;
+    // Synchronize legacy globals used by terminal.h and framebufferstuff.h
+    g_term_ox = tox;
+    g_term_oy = toy;
+    // g_term_max_cols/rows already set above
+
+    // Create initial windows using the new API
+    wm_create_window("Terminal", tox, toy, (int32_t)test_w, (int32_t)test_h, false, true, WIN_TYPE_TERM);
+    wm_create_window("Visual Test", (int32_t)wm_win_x + 50, (int32_t)wm_win_y + 50, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_TEST);
+    wm_create_window("Rainbow Animation", (int32_t)wm_win_x + 100, (int32_t)wm_win_y + 100, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_RAIN);
+    wm_create_window("Boot Log", (int32_t)wm_win_x + 150, (int32_t)wm_win_y + 150, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_LOG);
 
     for (int i = 0; i < 360; i++) {
         g_rainbow_lut[i] = wm_rainbow_color(i * 2);
     }
 
-    // Precompute a wallpaper image the size of the framebuffer so the
-    // compositor can punch window holes in it efficiently.
     wm_init_wallpaper();
 
-    // Note: Terminal state initialized in terminal.h / term_clear_screen
     if (g_backbuffer) memset_32(g_backbuffer, 0, (g_term_max_rows * 10) * (fb->pitch / 4));
     term_dirty_all();
 }
@@ -925,46 +1020,8 @@ static inline void wm_init() {
 // Static region to backup pixels under overlays for inclusive staging
 static uint32_t g_overlay_backup[256]; 
 
-static inline int wm_find_top_window(int32_t mx, int32_t my) {
-    for (int s = 3; s >= 0; s--) {
-        int idx = g_win_order[s];
-        if (!g_win_visible[idx]) continue;
-        WinRect r; get_win_rect(idx, &r);
-        if (mx >= r.x1 && mx < r.x2 && my >= r.y1 && my < r.y2) return idx;
-    }
-    return -1;
-}
+// Removed old fixed-window helpers
 
-static inline void wm_raise_window(int idx) {
-    int old_pos = -1;
-    for (int i = 0; i < 4; i++) if (g_win_order[i] == idx) old_pos = i;
-    if (old_pos == -1 || old_pos == 3) return;
-    for (int i = old_pos; i < 3; i++) g_win_order[i] = g_win_order[i+1];
-    g_win_order[3] = idx;
-    g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
-    g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
-    g_needs_refresh = true;
-}
-
-static inline bool wm_is_in_title(int idx, int32_t mx, int32_t my) {
-    WinRect r; get_win_rect(idx, &r);
-    return (mx >= r.x1 && mx < r.x2 && my >= r.y1 && my < r.y1 + (int32_t)g_title_h);
-}
-
-static inline bool wm_is_in_close(int idx, int32_t mx, int32_t my) {
-    WinRect r; get_win_rect(idx, &r);
-    int32_t btn_x = r.x1 + (r.x2 - r.x1) - 24;
-    int32_t btn_y = r.y1 + 4;
-    return (mx >= btn_x && mx < btn_x + 20 && my >= btn_y && my < btn_y + 20);
-}
-
-static inline void wm_close_window(int idx) {
-    if (idx == WIN_TERM) return; // Terminal is immortal
-    g_win_visible[idx] = false;
-    g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
-    g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
-    g_needs_refresh = true;
-}
 
 static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                                      uint32_t min_y, uint32_t max_y) {
@@ -975,8 +1032,10 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     if (max_y >= fb->height) max_y = fb->height - 1;
     if (min_y > max_y || min_x > max_x) return;
 
-    WinRect rects[4];
-    for (int i = 0; i < 4; i++) get_win_rect(i, &rects[i]);
+    WinRect rects[MAX_WINDOWS];
+    for (int i = 0; i < g_window_count; i++) {
+        if (g_window_list[i]) wm_get_win_rect(g_window_list[i], &rects[i]);
+    }
     
     // Metrics reset (B/W/r/L are updated DURING the frame, V is from last)
     g_time_bg_ticks   = 0;
@@ -998,11 +1057,11 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
 
         // Collect opaque spans for this scanline
         struct Span { int32_t x1, x2; };
-        Span spans[4];
+        Span spans[MAX_WINDOWS];
         int num_spans = 0;
         
-        for (int i = 0; i < 4; i++) {
-            if (rects[i].visible && (int32_t)y >= rects[i].y1 && (int32_t)y < rects[i].y2) {
+        for (int i = 0; i < g_window_count; i++) {
+            if (g_window_list[i] && rects[i].visible && (int32_t)y >= rects[i].y1 && (int32_t)y < rects[i].y2) {
                 // Intersects this scanline
                 int32_t sx1 = rects[i].x1; if (sx1 < (int32_t)min_x) sx1 = min_x;
                 int32_t sx2 = rects[i].x2; if (sx2 > (int32_t)max_x + 1) sx2 = max_x + 1;
@@ -1014,7 +1073,7 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
             }
         }
         
-        // Sort spans by x1 (insertion sort is fine for n <= 3)
+        // Sort spans by x1
         for (int i = 1; i < num_spans; i++) {
             Span key = spans[i];
             int j = i - 1;
@@ -1068,9 +1127,10 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     g_time_bg_ticks = t1 - t0;
 
     // Stage 2: Windows in stack order
-    for (int s = 0; s < 4; s++) {
-        int idx = g_win_order[s];
-        if (!g_win_visible[idx]) continue;
+    for (int s = 0; s < g_window_count; s++) {
+        int idx = g_window_order[s];
+        Window* win = g_window_list[idx];
+        if (!win || !win->visible) continue;
         WinRect r = rects[idx];
 
         int32_t dr1 = (r.y1 > (int32_t)min_y) ? r.y1 : (int32_t)min_y;
@@ -1079,13 +1139,13 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         if (dr2 > (int32_t)(fb->height - g_taskbar_h)) dr2 = fb->height - g_taskbar_h;
         if (dr1 >= dr2) continue;
 
-        if (idx == WIN_TERM) {
-            int32_t wx = g_term_ox, wy = g_term_oy;
+        if (win->is_system && win->type == WIN_TYPE_TERM) {
+            int32_t wx = win->x, wy = win->y;
             int32_t ww = (int32_t)g_term_max_cols * 8, wh = (int32_t)g_term_max_rows * 10;
-            wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, "Terminal", false, min_y, max_y);
+            wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, false, min_y, max_y);
             for (int32_t y = dr1; y < dr2; y++) {
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-                if (y >= r.y1 + g_title_h) {
+                if (y >= r.y1 + (int32_t)g_title_h) {
                     int32_t s_x = r.x1; if (s_x < 0) s_x = 0;
                     int32_t e_x = r.x2; if (e_x > (int32_t)fb->width) e_x = fb->width;
                     if (e_x > s_x) {
@@ -1093,11 +1153,8 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                         bool in_text_cols_zone = ((int32_t)wx > s_x || e_x > (int32_t)(wx + ww));
 
                         if (!in_text_rows || !in_text_cols_zone) {
-                            // Top padding strip (between titlebar and text), or bottom border:
-                            // Fill the full row with gray.
                             memset_32(drow + s_x, 0xFFBBBBBB, e_x - s_x);
                         } else {
-                            // In the text rows: only draw left and right chrome strips.
                             if ((int32_t)wx > s_x) memset_32(drow + s_x, 0xFFBBBBBB, wx - s_x);
                             int32_t w_end = wx + ww;
                             if (e_x > w_end) memset_32(drow + w_end, 0xFFBBBBBB, e_x - w_end);
@@ -1115,8 +1172,8 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                     }
                 }
             }
-        } else if (idx == WIN_TEST) {
-            wm_draw_window_chrome(r.x1, r.y1, (int32_t)test_w, (int32_t)test_h + (int32_t)g_title_h, "Visual Test", true, min_y, max_y);
+        } else if (win->is_system && win->type == WIN_TYPE_TEST) {
+            wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, true, min_y, max_y);
             for (int32_t y = dr1; y < dr2; y++) {
                 if (y < r.y1 + (int32_t)g_title_h) continue;
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
@@ -1132,8 +1189,8 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                     }
                 }
             }
-        } else if (idx == WIN_RAIN) {
-            wm_draw_window_chrome(r.x1, r.y1, (int32_t)rain_w, (int32_t)rain_h + (int32_t)g_title_h, "Rainbow Animation", true, min_y, max_y);
+        } else if (win->is_system && win->type == WIN_TYPE_RAIN) {
+            wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, true, min_y, max_y);
             for (int32_t y = dr1; y < dr2; y++) {
                 if (y < r.y1 + (int32_t)g_title_h) continue;
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
@@ -1141,63 +1198,70 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                 int32_t e_x = r.x2; if (e_x > (int32_t)fb->width) e_x = fb->width;
                 if (e_x > s_x) wm_draw_rainbow_content(drow + s_x, e_x - s_x, rain_scroll, (uint32_t)(s_x - r.x1));
             }
-        } else if (idx == WIN_LOG) {
+        } else if (win->is_system && win->type == WIN_TYPE_LOG) {
             int32_t lw = (int32_t)g_log_win_cols * LOG_CHAR_W;
             int32_t lh = (int32_t)g_log_rows_visible * LOG_CHAR_H;
-            wm_draw_window_chrome(r.x1, r.y1, lw + (int32_t)(g_border + g_pad) * 2, lh + (int32_t)(g_title_h + g_border * 2 + g_pad * 2), "Boot Log", true, min_y, max_y); 
+            wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, true, min_y, max_y); 
 
             for (int32_t y = dr1; y < dr2; y++) {
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-                if (y >= r.y1 + g_title_h) {
+                if (y >= r.y1 + (int32_t)g_title_h) {
                     int32_t s_x = r.x1; if (s_x < 0) s_x = 0;
                     int32_t e_x = r.x2; if (e_x > (int32_t)fb->width) e_x = fb->width;
                     if (e_x > s_x) {
-                        bool in_text_rows = (y >= log_win_y && y < log_win_y + lh);
-                        bool in_text_cols_zone = ((int32_t)log_win_x > s_x || e_x > (int32_t)(log_win_x + lw));
+                        bool in_text_rows = (y >= win->y && y < win->y + lh);
+                        bool in_text_cols_zone = ((int32_t)win->x > s_x || e_x > (int32_t)(win->x + lw));
 
                         if (!in_text_rows || !in_text_cols_zone) {
-                            // Top padding strip or side/bottom borders: Fill with gray.
                             memset_32(drow + s_x, 0xFFBBBBBB, e_x - s_x);
                         } else {
-                            // In the text rows: draw left/right gray strips, and the dark text background.
-                            if ((int32_t)log_win_x > s_x) memset_32(drow + s_x, 0xFFBBBBBB, log_win_x - s_x);
-                            int32_t w_end = log_win_x + lw;
+                            if ((int32_t)win->x > s_x) memset_32(drow + s_x, 0xFFBBBBBB, win->x - s_x);
+                            int32_t w_end = win->x + lw;
                             if (e_x > w_end) memset_32(drow + w_end, 0xFFBBBBBB, e_x - w_end);
-                            
-                            // The actual dark text area
-                            int32_t tx1 = log_win_x; if (tx1 < s_x) tx1 = s_x;
-                            int32_t tx2 = log_win_x + lw; if (tx2 > e_x) tx2 = e_x;
+                            int32_t tx1 = win->x; if (tx1 < s_x) tx1 = s_x;
+                            int32_t tx2 = win->x + lw; if (tx2 > e_x) tx2 = e_x;
                             if (tx1 < tx2) memset_32(drow + tx1, 0xFF0a0a14, tx2 - tx1);
                         }
                     }
                 }
             }
-
-            // Draw pre-rendered text area using fast SIMD memcpy
             uint32_t* lbb = g_log_win_backbuffer;
             if (lbb) {
                 uint32_t stride = g_log_stride;
                 uint32_t bw = g_log_win_cols * LOG_CHAR_W;
                 uint32_t bh = g_log_rows_visible * LOG_CHAR_H;
                 for (uint32_t r = 0; r < bh; r++) {
-                    int32_t s_ry = log_win_y + (int32_t)r;
+                    int32_t s_ry = win->y + (int32_t)r;
                     if (s_ry < (int32_t)min_y || s_ry > (int32_t)max_y) continue;
                     if (s_ry < 0 || (uint32_t)s_ry >= fb->height) continue;
-
-                    int32_t lwx = log_win_x; if (lwx < 0) lwx = 0;
-                    int32_t lww = (int32_t)bw; if (log_win_x < 0) lww += log_win_x;
+                    int32_t lwx = win->x; if (lwx < 0) lwx = 0;
+                    int32_t lww = (int32_t)bw; if (win->x < 0) lww += win->x;
                     if (lwx + lww > (int32_t)fb->width) lww = (int32_t)fb->width - lwx;
-                    
                     if (lww > 0) {
-                        uint32_t src_off_x = (log_win_x < 0) ? (uint32_t)(-log_win_x) : 0;
+                        uint32_t src_off_x = (win->x < 0) ? (uint32_t)(-win->x) : 0;
                         uint8_t* dst = g_master_backbuffer + (uint64_t)s_ry * fb->pitch + (uint64_t)lwx * 4;
                         uint8_t* src = (uint8_t*)(lbb + (uint64_t)r * stride) + src_off_x * 4;
                         memcpy_vram_sse_headless(dst, src, lww * 4);
                     }
                 }
             }
-
-
+        } else {
+            // General window rendering from buffer
+            wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, win->closable, min_y, max_y);
+            if (win->buffer) {
+                for (int32_t y = dr1; y < dr2; y++) {
+                    if (y < r.y1 + (int32_t)g_title_h) continue;
+                    uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
+                    int32_t ry = y - (r.y1 + (int32_t)g_title_h);
+                    int32_t wx = r.x1; if (wx < 0) wx = 0;
+                    int32_t ww = (r.x2 - r.x1); if (r.x1 < 0) ww += r.x1;
+                    if (wx + ww > (int32_t)fb->width) ww = (int32_t)fb->width - wx;
+                    if (ww > 0) {
+                        uint32_t src_off = (r.x1 < 0) ? (uint32_t)(-r.x1) : 0;
+                        memcpy_vram_sse_headless(drow + wx, (uint32_t*)((uint8_t*)win->buffer + (uint64_t)ry * win->buffer_pitch) + src_off, ww * 4);
+                    }
+                }
+            }
         }
     }
 
@@ -1314,13 +1378,13 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         }
 
         // ── Window task buttons ───────────────────────────────────────────────
-        const char* win_labels[4] = { "Terminal", "Visual Test", "Rainbow", "Boot Log" };
         const int32_t WBTN_GAP = (int32_t)(4 * fb->height) / 1080;
         int32_t cur_x = sb_x + g_sb_w + (int32_t)(10 * fb->height) / 1080;
-        int32_t active_idx = g_win_order[3];   // topmost window
+        int32_t active_idx = (g_window_count > 0) ? g_window_order[g_window_count - 1] : -1;
 
-        for (int idx = 0; idx < 4; idx++) {
-            if (!g_win_visible[idx]) continue;
+        for (int idx = 0; idx < g_window_count; idx++) {
+            Window* win = g_window_list[idx];
+            if (!win || !win->visible) continue;
             bool active = (idx == active_idx);
 
             uint32_t top_c  = active ? 0xFF3d4d80 : 0xFF23283d;
@@ -1329,7 +1393,6 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
 
             draw_btn(cur_x, sb_y, g_wbtn_w, sb_h, top_c, bot_c, edge_c, active);
 
-            // Active indicator: 3px bright bar along the top edge
             if (active) {
                 int32_t bar_y = sb_y;
                 if (bar_y >= (int32_t)min_y && bar_y <= (int32_t)max_y &&
@@ -1342,9 +1405,8 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                 }
             }
 
-            // Window label, left-padded
             wm_draw_string(cur_x + 8, sb_y + (int32_t)(sb_h - char_h) / 2,
-                        win_labels[idx],
+                        win->title,
                         active ? 0xFFEEEEFF : 0xFF8888AA,
                         g_font_scale_100);
 
